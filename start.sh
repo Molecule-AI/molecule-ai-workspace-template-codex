@@ -46,4 +46,4 @@ fi
 
 # Hand off to molecule-runtime. From here, every A2A message routes
 # through executor.py → app_server.py → codex app-server child.
-exec gosu -E agent molecule-runtime
+exec gosu agent molecule-runtime
