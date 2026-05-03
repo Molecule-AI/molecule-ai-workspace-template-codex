@@ -42,7 +42,39 @@ CONFIG_TOML="${CODEX_HOME}/config.toml"
 # children may not inherit the same PATH as the parent shell, so the
 # absolute path is safer than relying on `python3` being resolvable
 # inside whatever sandbox codex spawns the child under.
-PYTHON_BIN="${MOLECULE_MCP_PYTHON:-$(command -v python3 || command -v python || echo python3)}"
+#
+# Prefer the runtime venv (`/opt/molecule-venv/bin/python3`) where
+# molecule-ai-workspace-runtime is installed by the host install.sh.
+# /usr/bin/python3 has only the system stdlib and no molecule_runtime,
+# so picking it here causes codex to fail the MCP handshake on first
+# call: "MCP client for `molecule` failed to start: handshaking with
+# MCP server failed: connection closed: initialize response" (the
+# subprocess crashes with ModuleNotFoundError before the JSON-RPC
+# handshake completes). Walk a list of well-known interpreters and
+# pick the first one that can `import molecule_runtime`.
+resolve_python() {
+  if [ -n "${MOLECULE_MCP_PYTHON:-}" ] && [ -x "${MOLECULE_MCP_PYTHON}" ]; then
+    echo "${MOLECULE_MCP_PYTHON}"
+    return
+  fi
+  for cand in /opt/molecule-venv/bin/python3 /opt/molecule-venv/bin/python \
+              "$(command -v python3 2>/dev/null)" "$(command -v python 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ] && \
+       "$cand" -c "import molecule_runtime" >/dev/null 2>&1; then
+      echo "$cand"
+      return
+    fi
+  done
+  # Last-resort fallback so the config is still well-formed; the
+  # MCP handshake will still fail at runtime, but at install time
+  # we surface a warning rather than aborting the whole boot.
+  echo "${MOLECULE_MCP_PYTHON:-/opt/molecule-venv/bin/python3}"
+}
+PYTHON_BIN="$(resolve_python)"
+if ! "$PYTHON_BIN" -c "import molecule_runtime" >/dev/null 2>&1; then
+  echo "[codex-mcp] WARNING: ${PYTHON_BIN} cannot import molecule_runtime;" \
+    "MCP handshake will fail at runtime. Install molecule-ai-workspace-runtime first." >&2
+fi
 
 # Resolve the platform-runtime env that the a2a_mcp_server reads on
 # startup. Fall back to the same defaults a2a_client.py uses so the
