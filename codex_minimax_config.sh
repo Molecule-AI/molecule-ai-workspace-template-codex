@@ -61,3 +61,32 @@ if command -v stat >/dev/null 2>&1; then
 fi
 
 echo "[codex-minimax] wrote ${CONFIG_TOML} model=${MODEL} provider=minimax"
+
+# Also patch /configs/config.yaml so molecule-runtime's load_config()
+# passes ${MODEL} to executor.py instead of the library default
+# (anthropic:claude-opus-4-7), which codex CLI rejects with
+# `unknown model 'anthropic:claude-opus-4-7' (2013)` and hangs the
+# first turn until task_complete that never arrives. Caught live on
+# the 4-runtime A2A E2E (2026-05-03): codex executor took the turn
+# lock, called turn/start with the wrong model, and never released
+# — every subsequent A2A request piled up in the workspace-server
+# queue as "busy".
+#
+# The provisioner has a MODEL_PROVIDER pass-through (ec2.go:1923) but
+# never exports it from user-data, so the only path for a runtime to
+# get the right model is to patch config.yaml from the install-time
+# context that knows about MINIMAX_API_KEY.
+WORKSPACE_CONFIG_DIR="${WORKSPACE_CONFIG_PATH:-/configs}"
+WORKSPACE_CONFIG="${WORKSPACE_CONFIG_DIR}/config.yaml"
+if [ -f "$WORKSPACE_CONFIG" ] && [ -w "$WORKSPACE_CONFIG_DIR" ]; then
+  if grep -qE '^model:' "$WORKSPACE_CONFIG"; then
+    sed -i.bak "s|^model: .*|model: '${MODEL}'|" "$WORKSPACE_CONFIG" && rm -f "${WORKSPACE_CONFIG}.bak"
+  else
+    printf "model: '%s'\n" "$MODEL" >> "$WORKSPACE_CONFIG"
+  fi
+  echo "[codex-minimax] patched ${WORKSPACE_CONFIG} model=${MODEL}"
+elif [ -f "$WORKSPACE_CONFIG" ]; then
+  # Read-only mount or wrong owner — log so operators can debug
+  # rather than silently shipping the wrong default model.
+  echo "[codex-minimax] WARN: ${WORKSPACE_CONFIG} exists but ${WORKSPACE_CONFIG_DIR} not writable; runtime will use default model" >&2
+fi

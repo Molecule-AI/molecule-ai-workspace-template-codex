@@ -80,6 +80,45 @@ env MINIMAX_API_KEY="mm-test-123" CODEX_MINIMAX_MODEL="MiniMax-M2.1" \
 assert "case3 picks up model override" \
   "grep -q 'model = .MiniMax-M2.1.' '$WORK/codex/config.toml'"
 
+# ---- case 5: WORKSPACE_CONFIG_PATH (config.yaml model patch) -------
+echo "=== case 5: patches /configs/config.yaml model field ==="
+rm -rf "$WORK/codex" "$WORK/configs"
+mkdir -p "$WORK/codex" "$WORK/configs"
+cat > "$WORK/configs/config.yaml" <<EOF
+name: test-ws
+runtime: codex
+a2a:
+  port: 8000
+  streaming: true
+EOF
+env MINIMAX_API_KEY="mm-test-123" HOME="$WORK" CODEX_HOME="$WORK/codex" \
+    WORKSPACE_CONFIG_PATH="$WORK/configs" PATH="/usr/bin:/bin" \
+  bash "$SCRIPT" > "$WORK/case5.out" 2>&1 || true
+
+assert "case5 logs config.yaml patch" "grep -q 'patched .*config.yaml' '$WORK/case5.out'"
+assert "case5 appends model to config.yaml" \
+  "grep -q \"model: 'codex-MiniMax-M2.7'\" '$WORK/configs/config.yaml'"
+
+# ---- case 6: existing model in config.yaml gets replaced -----------
+echo "=== case 6: replaces existing model line in config.yaml ==="
+rm -rf "$WORK/codex"
+mkdir -p "$WORK/codex"
+cat > "$WORK/configs/config.yaml" <<EOF
+name: test-ws
+model: anthropic:claude-opus-4-7
+runtime: codex
+EOF
+env MINIMAX_API_KEY="mm-test-123" HOME="$WORK" CODEX_HOME="$WORK/codex" \
+    WORKSPACE_CONFIG_PATH="$WORK/configs" PATH="/usr/bin:/bin" \
+  bash "$SCRIPT" > "$WORK/case6.out" 2>&1 || true
+
+assert "case6 model replaced (no anthropic line)" \
+  "! grep -q 'anthropic:claude-opus-4-7' '$WORK/configs/config.yaml'"
+assert "case6 model set to codex-MiniMax-M2.7" \
+  "grep -q \"model: 'codex-MiniMax-M2.7'\" '$WORK/configs/config.yaml'"
+assert "case6 has exactly one model: line" \
+  "[ \"\$(grep -cE '^model:' '$WORK/configs/config.yaml')\" = '1' ]"
+
 # ---- case 4: MINIMAX_API_BASE override (China region) --------------
 echo "=== case 4: base_url override (China region) ==="
 rm -rf "$WORK/codex"
