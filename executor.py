@@ -206,52 +206,84 @@ class CodexAppServerExecutor(AgentExecutor):
         loop = asyncio.get_running_loop()
 
         def on_notification(method: str, params: dict[str, Any]) -> None:
-            # Codex app-server notifications. The schema is `experimental`
-            # and has shifted across releases — current codex 0.72 emits
-            # snake_case event names (`agent_message`, `task_complete`,
-            # `turn_aborted`); earlier codex 2.x emitted slash/dot forms
-            # (`turn/completed`). We accept both shapes so a codex bump
-            # doesn't strand the workspace silently with empty replies
-            # (caught live during the 2026-05-03 4-runtime A2A E2E:
-            # codex 0.72 returned empty text because executor only knew
-            # the old `turn/completed` + `agent_message_delta` names).
+            # Codex 0.72 wraps all event notifications under a single
+            # `codex/event/<type>` JSON-RPC method, with the actual
+            # event under `params.msg` and `params.msg.type` carrying
+            # the event-type tag. There's a parallel set of bare
+            # methods (`item/started`, `turn/started`, `error`) that
+            # mirror a subset for legacy clients — we ignore those
+            # and read the canonical `codex/event/*` stream.
             #
-            # Surfaced events:
-            #   - text deltas: `agent_message_delta` (chunk) and
-            #     `agent_message` (whole — fired when the model chose
-            #     not to stream chunks; we treat it as a final delta)
-            #   - completion: `task_complete` (0.72) /
-            #     `turn/completed` (older schemas)
-            #   - error/abort: `error_notification`, `turn_aborted`,
-            #     `stream_error`
-            # Other notifications (reasoning, tool exec, token usage)
-            # are debug-logged for observability but not surfaced.
-            if method == "agent_message_delta":
-                delta = params.get("delta") or params.get("text") or ""
+            # Captured live by running `codex app-server` directly
+            # against a fresh thread (2026-05-03). Pre-fix the
+            # executor matched on `agent_message_delta` /
+            # `turn/completed` directly as the JSON-RPC method, which
+            # never fires in codex 0.72 — every probe returned empty
+            # text + the workspace looked healthy.
+            #
+            # Surfaced events (msg.type values):
+            #   - agent_message_delta — streamed chunk (delta)
+            #   - agent_message       — whole reply (when model didn't stream)
+            #   - task_complete       — turn finished cleanly
+            #   - error               — fatal turn error
+            # Reasoning / item / tool events are debug-logged.
+            if method == "error":
+                # Bare-method `error` notifications (parallel schema)
+                # carry the error payload under `params.error`. These
+                # often duplicate a `codex/event/stream_error` —
+                # surface only the final non-retry one so the operator
+                # sees the real failure.
+                err = params.get("error") or {}
+                if not params.get("willRetry"):
+                    state.error = RuntimeError(
+                        str(err.get("message") or "unknown codex error")
+                    )
+                    loop.call_soon_threadsafe(state.completed.set)
+                return
+
+            if not method.startswith("codex/event/"):
+                logger.debug("codex notification: %s %s", method, params)
+                return
+
+            msg = params.get("msg") or {}
+            mtype = msg.get("type", "")
+            if mtype == "agent_message_delta":
+                delta = msg.get("delta") or msg.get("text") or ""
                 if delta:
                     state.deltas.append(delta)
-            elif method == "agent_message":
+            elif mtype == "agent_message":
                 # Whole-message form: codex emits this when the model
-                # response wasn't streamed as chunks. The full text
-                # lives under `message` (0.72) or `text`. Append it
-                # as a single delta so the assembled string is
-                # complete even when no `_delta` notifications fire.
-                msg = params.get("message") or params.get("text") or ""
-                if msg:
-                    state.deltas.append(msg)
-            elif method in ("turn/completed", "turn.completed", "task_complete"):
-                # Tolerate dotted / slashed / snake_case schema variants
-                # (codex changes these across minors). Also accept both
-                # `turnId` and `id` for the params id field.
-                tid = params.get("turnId") or params.get("id") or params.get("task_id")
-                if tid in (None, state.turn_id):
-                    loop.call_soon_threadsafe(state.completed.set)
-            elif method in ("error_notification", "stream_error", "turn_aborted"):
-                msg = params.get("message") or params.get("error") or method
-                state.error = RuntimeError(str(msg))
+                # response wasn't streamed as chunks (most non-OpenAI
+                # backends). Append as a single delta so the assembled
+                # string is complete even without `_delta` fragments.
+                whole = msg.get("message") or msg.get("text") or ""
+                if whole:
+                    state.deltas.append(whole)
+            elif mtype == "task_complete":
+                # task_complete carries `last_agent_message` — when
+                # the model returned a single message and skipped
+                # streaming, this is the only place the text shows
+                # up. Treat it as a final delta if we haven't seen
+                # an `agent_message` already (idempotent dedupe).
+                last = msg.get("last_agent_message") or ""
+                if last and last not in state.deltas:
+                    state.deltas.append(last)
                 loop.call_soon_threadsafe(state.completed.set)
+            elif mtype == "error":
+                state.error = RuntimeError(
+                    str(msg.get("message") or "unknown codex error")
+                )
+                loop.call_soon_threadsafe(state.completed.set)
+            elif mtype == "stream_error":
+                # Retry signal — codex retries internally. Log it
+                # but don't surface; the final `error` (or
+                # task_complete) will resolve the turn.
+                logger.info(
+                    "codex stream_error (will retry): %s",
+                    msg.get("message", "")
+                )
             else:
-                logger.debug("codex notification: %s %s", method, params)
+                logger.debug("codex event: %s %s", mtype, msg)
 
         unsubscribe = self._app_server.subscribe(on_notification)
         try:
