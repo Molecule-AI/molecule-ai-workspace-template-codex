@@ -66,3 +66,17 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 1
 fi
 echo "[install.sh] codex ready: $(command -v codex) ($(codex --version 2>/dev/null || echo version-unknown))"
+
+# --- Bare-host MiniMax provider config -----------------------------
+# In the SaaS bare-host boot path, install.sh runs once and then CP's
+# user-data exec's molecule-runtime — there's no equivalent of Docker's
+# start.sh that we can hook codex_minimax_config.sh into. Invoke it
+# here so the [model_providers.minimax] block lands in ~/.codex/config.toml
+# before codex first runs. Bridge script no-ops when MINIMAX_API_KEY is
+# missing, so OpenAI-direct deploys see no behavior change.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/codex_minimax_config.sh" ]; then
+  echo "[install.sh] running codex_minimax_config.sh (provider config write)"
+  bash "$SCRIPT_DIR/codex_minimax_config.sh" || \
+    echo "[install.sh] WARN: codex_minimax_config.sh exited non-zero — workspace may run on default provider" >&2
+fi
