@@ -34,10 +34,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
       pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi && \
-    python3 -c "import molecule_runtime.preflight as pf; pf.SUPPORTED_RUNTIMES.add('codex')" && \
-    SITE=$(python3 -c 'import molecule_runtime.preflight as p; print(p.__file__)') && \
-    sed -i "s/SUPPORTED_RUNTIMES = {/SUPPORTED_RUNTIMES = {'codex',/" "$SITE"
+    fi
 
 COPY adapter.py executor.py app_server.py __init__.py ./
 COPY start.sh /usr/local/bin/start.sh
