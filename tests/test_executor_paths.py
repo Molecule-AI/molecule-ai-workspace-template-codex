@@ -126,6 +126,37 @@ async def test_execute_handles_turn_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_wraps_runtimeerror_from_notification_path():
+    """When codex emits an `error` notification mid-turn, `_run_turn`
+    raises a RuntimeError. execute() should wrap it with the same
+    `[codex error]` prefix the AppServerError path uses — without
+    this wrap, a2a-sdk's top-level handler returns a bare JSON-RPC
+    -32603, which surfaces in the canvas as a confusing protocol
+    error rather than the actual upstream message.
+
+    Captured live on staging 2026-05-03 against codex 0.72: a fake
+    OPENAI_API_KEY produced `unexpected status 401 Unauthorized` from
+    the codex HTTP client; pre-fix the canvas saw the raw JSON-RPC
+    wrapper with the message buried in `error.message`."""
+    fake = FakeAppServer()
+    ex = _make(fake)
+    queue = _CapturingQueue()
+
+    async def driver():
+        for _ in range(50):
+            if any(m == "turn/start" for m, _ in fake.requests):
+                break
+            await asyncio.sleep(0.01)
+        fake.push_event("error", message="unexpected status 401 Unauthorized")
+
+    await asyncio.gather(ex.execute(_ctx("test 401"), queue), driver())
+    assert len(queue.events) == 1
+    text = repr(queue.events[0])
+    assert "codex error" in text
+    assert "401" in text
+
+
+@pytest.mark.asyncio
 async def test_execute_handles_connection_error_and_resets():
     """ConnectionError mid-turn should drop cached state so the next
     turn re-bootstraps."""
