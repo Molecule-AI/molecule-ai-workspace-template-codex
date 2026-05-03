@@ -134,6 +134,66 @@ env -i HOME="$WORK" CODEX_HOME="$WORK/codex" PATH="/usr/bin:/bin:/usr/local/bin"
 assert "case5 picks up python override" \
   "grep -q 'command = \"/opt/venv/bin/python3.11\"' '$WORK/codex/config.toml'"
 
+# ---- case 6: regression — no python imports molecule_runtime -------
+# Pre-fix bug: resolver returned `command -v python3` (=/usr/bin/python3,
+# stdlib only) without verifying it could import molecule_runtime, then
+# codex spawned the MCP subprocess which crashed with ModuleNotFoundError
+# before the JSON-RPC handshake completed. Since fix #17 the resolver
+# walks each candidate and verifies `import molecule_runtime`; if none
+# succeed, falls back to the venv path AND emits a warning so operators
+# can debug at install-time instead of canvas-chat-time.
+echo "=== case 6: warning fires when no python imports molecule_runtime ==="
+rm -rf "$WORK/codex"
+mkdir -p "$WORK/codex"
+env -i HOME="$WORK" CODEX_HOME="$WORK/codex" PATH="/usr/bin:/bin" \
+    WORKSPACE_ID="ws-6" \
+  bash "$SCRIPT" > "$WORK/case6.out" 2>&1 || true
+
+assert "case6 emits 'cannot import molecule_runtime' warning" \
+  "grep -q 'cannot import molecule_runtime' '$WORK/case6.out'"
+assert "case6 last-resort fallback is /opt/molecule-venv/bin/python3" \
+  "grep -q 'command = \"/opt/molecule-venv/bin/python3\"' '$WORK/codex/config.toml'"
+
+# ---- case 7: resolver picks first candidate that imports molecule_runtime
+# Mock python that pretends `import molecule_runtime` succeeds. Place it
+# at the front of PATH and assert the resolver picks it over the system
+# python (which has no molecule_runtime in CI).
+echo "=== case 7: resolver picks PATH python that can import molecule_runtime ==="
+rm -rf "$WORK/codex" "$WORK/fake-bin"
+mkdir -p "$WORK/codex" "$WORK/fake-bin"
+cat > "$WORK/fake-bin/python3" <<'EOF'
+#!/bin/bash
+# Mock python: `python3 -c "import molecule_runtime"` succeeds; everything else fails.
+case "$*" in
+  *"import molecule_runtime"*) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$WORK/fake-bin/python3"
+
+env -i HOME="$WORK" CODEX_HOME="$WORK/codex" PATH="$WORK/fake-bin:/usr/bin:/bin" \
+    WORKSPACE_ID="ws-7" \
+  bash "$SCRIPT" > "$WORK/case7.out" 2>&1 || true
+
+assert "case7 picks fake python from PATH (importable)" \
+  "grep -q \"command = \\\"$WORK/fake-bin/python3\\\"\" '$WORK/codex/config.toml'"
+assert "case7 does NOT emit the cannot-import warning" \
+  "! grep -q 'cannot import molecule_runtime' '$WORK/case7.out'"
+
+# ---- case 8: ordering parity — venv candidates BEFORE PATH lookup --
+# Anchor the resolver's candidate ordering: /opt/molecule-venv/bin/python3
+# must be tried BEFORE `command -v python3`. Without this ordering the
+# original bug returns: on a machine with both /opt/molecule-venv/bin/python3
+# AND /usr/bin/python3 importable, picking the system one means leaking
+# whatever stale molecule_runtime was installed there.
+echo "=== case 8: parity — venv candidates appear before PATH in resolver ==="
+venv_line=$(grep -nE '/opt/molecule-venv/bin/python3' "$SCRIPT" | head -1 | cut -d: -f1)
+path_line=$(grep -nE 'command -v python3' "$SCRIPT" | head -1 | cut -d: -f1)
+assert "case8 venv path is referenced in $SCRIPT" "[ -n '$venv_line' ]"
+assert "case8 PATH lookup is referenced in $SCRIPT" "[ -n '$path_line' ]"
+assert "case8 venv path appears BEFORE PATH lookup (line $venv_line < $path_line)" \
+  "[ '$venv_line' -lt '$path_line' ]"
+
 echo
 echo "results: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
