@@ -161,6 +161,20 @@ class CodexAppServerExecutor(AgentExecutor):
                     new_text_message(f"[codex unreachable] {exc!s}")
                 )
                 return
+            except RuntimeError as exc:
+                # Surfaced from `state.error` in `_run_turn` — codex emitted
+                # an `error` notification (typically an upstream HTTP failure
+                # from the model provider, e.g. `unexpected status 401
+                # Unauthorized`). Wrapping with the same `[codex error]`
+                # prefix the AppServerError path uses keeps the canvas-side
+                # behavior consistent: a clear inline message instead of a
+                # bare JSON-RPC -32603 leak from the a2a-sdk top-level
+                # handler.
+                logger.warning("codex turn surfaced error: %s", exc)
+                await event_queue.enqueue_event(
+                    new_text_message(f"[codex error] {exc}")
+                )
+                return
 
         await event_queue.enqueue_event(new_text_message(text))
 
