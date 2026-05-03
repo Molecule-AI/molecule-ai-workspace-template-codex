@@ -387,3 +387,118 @@ async def test_turn_start_accepts_legacy_turnId_field():
     text = await ex._run_turn("legacy")
     await driver_task
     assert text == ""  # no deltas pushed
+
+
+# ---- turn/steer push parity (mid-turn steering) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_steers_when_turn_in_flight():
+    """When a NEW message arrives while a turn is already in flight,
+    execute() should fire `turn/steer` to inject the new prompt into
+    the active turn instead of blocking on _turn_lock for the full
+    prior-turn duration. Push parity with claude-code's
+    `notifications/claude/channel` mid-session interrupt.
+    """
+    fake = FakeAppServer()
+    ex = _make(fake)
+    queue = _CapturingQueue()
+
+    # Simulate "turn in flight": lock held + thread/turn ids set, as
+    # they would be from a real concurrent _run_turn() invocation.
+    ex._thread_id = "th_active"
+    ex._current_turn_id = "tu_active"
+    await ex._turn_lock.acquire()
+    try:
+        await ex.execute(_ctx("steered prompt"), queue)
+
+        # turn/steer should be the only routed call (no turn/start).
+        steer_calls = [
+            (m, p) for m, p in fake.requests if m == "turn/steer"
+        ]
+        start_calls = [m for m, _ in fake.requests if m == "turn/start"]
+        assert len(steer_calls) == 1, (
+            f"expected exactly one turn/steer, got {fake.requests}"
+        )
+        assert not start_calls, (
+            f"steer path must NOT also start a new turn, got {start_calls}"
+        )
+
+        method, params = steer_calls[0]
+        assert params["threadId"] == "th_active"
+        assert params["expectedTurnId"] == "tu_active"
+        assert params["input"] == [
+            {"type": "text", "text": "steered prompt"}
+        ]
+
+        # Placeholder delivered for the A2A response.
+        assert len(queue.events) == 1
+        assert "steered into in-flight turn" in repr(queue.events[0])
+    finally:
+        ex._turn_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_execute_falls_through_when_no_active_turn():
+    """Lock not held / no turn id → original path (turn/start). The
+    steer branch is gated on (lock held AND turn id set) — partial
+    state should fall through to the new-turn path so we don't fire
+    a turn/steer against a non-existent turn id."""
+    fake = FakeAppServer()
+    ex = _make(fake)
+    queue = _CapturingQueue()
+
+    async def driver():
+        for _ in range(50):
+            if any(m == "turn/start" for m, _ in fake.requests):
+                break
+            await asyncio.sleep(0.01)
+        fake.push_event("agent_message_delta", delta="ok")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
+
+    await asyncio.gather(ex.execute(_ctx("hi"), queue), driver())
+
+    # Confirms the steer branch did NOT fire when no turn was in flight.
+    assert not any(m == "turn/steer" for m, _ in fake.requests)
+    assert any(m == "turn/start" for m, _ in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_execute_falls_through_when_steer_raises_not_steerable():
+    """`turn/steer` returns ActiveTurnNotSteerable for review/manual-
+    compact turns OR if expectedTurnId mismatches (turn ended between
+    our lock-check and the steer call). On either, fall through to
+    the lock-and-wait path so the message still gets processed.
+    """
+    fake = FakeAppServer()
+    fake.turn_steer_raises = AppServerError("ActiveTurnNotSteerable")
+    ex = _make(fake)
+    queue = _CapturingQueue()
+
+    # Simulate active-turn state, but steer will raise.
+    ex._thread_id = "th_active"
+    ex._current_turn_id = "tu_active"
+    await ex._turn_lock.acquire()
+    # Release shortly so the fall-through path can acquire and proceed.
+    async def releaser():
+        await asyncio.sleep(0.05)
+        ex._turn_lock.release()
+    asyncio.create_task(releaser())
+
+    async def driver():
+        for _ in range(100):
+            if any(m == "turn/start" for m, _ in fake.requests):
+                break
+            await asyncio.sleep(0.01)
+        fake.push_event("agent_message_delta", delta="real reply")
+        fake.push_event("task_complete", task_id="tu_2", last_agent_message="")
+
+    await asyncio.gather(ex.execute(_ctx("retry"), queue), driver())
+
+    # Steer was attempted and failed; turn/start fired as fall-through.
+    assert any(m == "turn/steer" for m, _ in fake.requests)
+    assert any(m == "turn/start" for m, _ in fake.requests)
+    # The fall-through path delivered the real reply, not the placeholder.
+    text = repr(queue.events[-1])
+    assert "real reply" in text
+    assert "steered into in-flight" not in text

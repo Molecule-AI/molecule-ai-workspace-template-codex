@@ -47,6 +47,7 @@ class FakeAppServer:
         self.thread_start_response: dict | None = None
         self.turn_start_responses: list[dict] = []
         self.turn_start_raises: Exception | None = None
+        self.turn_steer_raises: Exception | None = None
 
     async def initialize(self, *, client_info: dict) -> dict:
         return {"userAgent": "fake/0.0"}
@@ -70,6 +71,10 @@ class FakeAppServer:
             return {"turn": {"id": f"tu_{self._next_turn}"}}
         if method == "turn/interrupt":
             return {}
+        if method == "turn/steer":
+            if self.turn_steer_raises:
+                raise self.turn_steer_raises
+            return {"turnId": (params or {}).get("expectedTurnId", "")}
         raise AssertionError(f"unexpected method: {method}")
 
     def subscribe(self, callback) -> "asyncio.coroutines.Coroutine":

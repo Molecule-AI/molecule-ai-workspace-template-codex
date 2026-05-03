@@ -135,6 +135,66 @@ class CodexAppServerExecutor(AgentExecutor):
             )
             return
 
+        # Push parity with claude-code: when a new message arrives while
+        # a turn is already in flight, inject it into the active turn
+        # via codex's `turn/steer` RPC instead of blocking on the lock
+        # for ~minutes until the prior turn finishes. This is the
+        # documented v2 codex app-server protocol primitive — see
+        # codex-rs/app-server/README.md§Steer-an-active-turn — and
+        # gives codex true mid-turn push semantics matching the
+        # `notifications/claude/channel` path Claude Code uses.
+        #
+        # The agent then sees the new prompt as additional input in the
+        # active turn's context. Per the molecule MCP server's
+        # instructions string, the agent replies via send_message_to_user
+        # (canvas) or delegate_task (peer) — the platform's reply path
+        # is tool-based, not the A2A response shape — so this execute()
+        # returning a placeholder is correct: the actual reply lands
+        # via the tool-call route, not through this event_queue.
+        if (
+            self._turn_lock.locked()
+            and self._app_server is not None
+            and self._thread_id is not None
+            and self._current_turn_id is not None
+        ):
+            try:
+                await self._app_server.request(
+                    "turn/steer",
+                    {
+                        "threadId": self._thread_id,
+                        "input": [{"type": "text", "text": prompt}],
+                        "expectedTurnId": self._current_turn_id,
+                    },
+                    timeout=5.0,
+                )
+                logger.info(
+                    "codex push: steered into active turn %s",
+                    self._current_turn_id,
+                )
+                # Status placeholder for the A2A response. The peer or
+                # canvas wrapper sees this; the agent's substantive
+                # reply comes via send_message_to_user / delegate_task
+                # MCP tool calls within the steered turn's response.
+                await event_queue.enqueue_event(
+                    new_text_message(
+                        "[steered into in-flight turn — agent will reply "
+                        "via send_message_to_user / delegate_task]"
+                    )
+                )
+                return
+            except (AppServerError, asyncio.TimeoutError) as exc:
+                # Steer failed — common causes:
+                #   - ActiveTurnNotSteerable (review/manual-compact turn)
+                #   - expectedTurnId mismatch (turn ended between our
+                #     locked-check and the steer request)
+                #   - app-server transport hiccup
+                # Fall through to the lock-and-wait path so the message
+                # still gets processed, just as a queued new turn.
+                logger.debug(
+                    "codex turn/steer failed (%s) — falling through to new-turn path",
+                    exc,
+                )
+
         async with self._turn_lock:
             try:
                 text = await self._run_turn(prompt)
