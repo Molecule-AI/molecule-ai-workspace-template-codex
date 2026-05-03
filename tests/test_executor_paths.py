@@ -88,8 +88,8 @@ async def test_execute_happy_path_emits_assembled_text():
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": "answer"})
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        fake.push_event("agent_message_delta", delta="answer")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
 
     await asyncio.gather(ex.execute(_ctx("question"), queue), driver())
     assert len(queue.events) == 1
@@ -230,8 +230,8 @@ async def test_completed_dotted_form_also_completes_turn():
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": "via dotted"})
-        fake.push("turn.completed", {"id": "tu_1"})  # dotted, not slashed
+        fake.push_event("agent_message_delta", delta="via dotted")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")  # dotted, not slashed
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("dotted")
@@ -256,8 +256,8 @@ async def test_codex072_snake_case_event_schema():
                 break
             await asyncio.sleep(0.01)
         # Whole-message form (codex 0.72 when model didn't stream chunks)
-        fake.push("agent_message", {"message": "snake_case ok"})
-        fake.push("task_complete", {"task_id": "tu_1"})
+        fake.push_event("agent_message", message="snake_case ok")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("snake-case")
@@ -277,7 +277,7 @@ async def test_codex072_turn_aborted_surfaces_as_error():
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("turn_aborted", {"message": "user pressed Ctrl-C"})
+        fake.push("error", {"error": {"message": "user pressed Ctrl-C"}, "willRetry": False})
 
     driver_task = asyncio.create_task(driver())
     with pytest.raises(RuntimeError, match="user pressed Ctrl-C"):
@@ -295,10 +295,10 @@ async def test_unknown_notification_methods_are_logged_and_ignored(caplog):
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("reasoning_delta", {"delta": "thinking..."})  # ignored
-        fake.push("tool_exec_start", {"name": "shell"})  # ignored
-        fake.push("agent_message_delta", {"delta": "ok"})
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        fake.push_event("agent_reasoning_delta", delta="thinking...")  # ignored
+        fake.push_event("exec_command_begin", command="shell")  # ignored
+        fake.push_event("agent_message_delta", delta="ok")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("test")
@@ -350,7 +350,7 @@ async def test_turn_start_accepts_legacy_turnId_field():
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("turn/completed", {"turnId": "tu_legacy"})
+        fake.push_event("task_complete", task_id="tu_legacy", last_agent_message="")
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("legacy")

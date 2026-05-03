@@ -93,6 +93,13 @@ class FakeAppServer:
         for cb in list(self._subscribers):
             cb(method, params or {})
 
+    def push_event(self, msg_type: str, **fields) -> None:
+        """Deliver a `codex/event/<type>` wrapped notification — matches
+        the real codex 0.72 schema. `fields` become entries of `params.msg`
+        alongside `type=msg_type`."""
+        msg = {"type": msg_type, **fields}
+        self.push(f"codex/event/{msg_type}", {"id": "0", "msg": msg, "conversationId": "test"})
+
 
 def _make_executor(fake: FakeAppServer, *, model: str = "gpt-5", system_prompt: str = "be helpful") -> CodexAppServerExecutor:
     cfg = AdapterConfig(model=model, system_prompt=system_prompt)
@@ -113,9 +120,9 @@ async def test_run_turn_starts_thread_and_returns_assembled_deltas() -> None:
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": "hello "})
-        fake.push("agent_message_delta", {"delta": "world"})
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        fake.push_event("agent_message_delta", delta="hello ")
+        fake.push_event("agent_message_delta", delta="world")
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("hi")
@@ -138,8 +145,8 @@ async def test_run_turn_reuses_thread_on_second_call() -> None:
             if count >= int(turn_id.split("_")[1]):
                 break
             await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": text})
-        fake.push("turn/completed", {"turnId": turn_id})
+        fake.push_event("agent_message_delta", delta=text)
+        fake.push_event("task_complete", task_id=turn_id, last_agent_message="")
 
     t1 = asyncio.create_task(drive_one("first", "tu_1"))
     text1 = await ex._run_turn("ping")
@@ -166,7 +173,7 @@ async def test_run_turn_surfaces_error_notification() -> None:
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("error_notification", {"message": "model rate limited"})
+        fake.push_event("error", message="model rate limited")
 
     driver_task = asyncio.create_task(driver())
     with pytest.raises(RuntimeError, match="rate limited"):
@@ -184,7 +191,7 @@ async def test_thread_start_passes_config() -> None:
             if any(m == "turn/start" for m, _ in fake.requests):
                 break
             await asyncio.sleep(0.01)
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        fake.push_event("task_complete", task_id="tu_1", last_agent_message="")
 
     driver_task = asyncio.create_task(driver())
     await ex._run_turn("hi")
@@ -219,8 +226,8 @@ async def test_turn_lock_serializes_concurrent_executes() -> None:
                     starts.append(idx)
                     break
                 await asyncio.sleep(0.005)
-            fake.push("agent_message_delta", {"delta": f"r{idx}"})
-            fake.push("turn/completed", {"turnId": f"tu_{idx + 1}"})
+            fake.push_event("agent_message_delta", delta=f"r{idx}")
+            fake.push_event("task_complete", task_id=f"tu_{idx + 1}", last_agent_message="")
             completes.append(idx)
 
         driver_task = asyncio.create_task(driver())
