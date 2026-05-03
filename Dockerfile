@@ -38,15 +38,19 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY adapter.py executor.py app_server.py __init__.py ./
 COPY start.sh /usr/local/bin/start.sh
-COPY codex_bridge.sh /usr/local/bin/codex_bridge.sh
-RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/codex_bridge.sh
+COPY codex_minimax_config.sh /usr/local/bin/codex_minimax_config.sh
+RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/codex_minimax_config.sh
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
-# both root and the agent user). Pin to a known-tested version range
-# — codex's app-server protocol is `experimental` and breaks across
-# minor versions. Bump deliberately when validating a new release.
-RUN npm install -g @openai/codex@^0.72
+# both root and the agent user).
+#
+# Pin to ^0.57 — MiniMax's official codex-cli docs flag a compat issue
+# on later versions ("The latest version of Codex CLI has compatibility
+# issues, version 0.57.0 is recommended"). 0.57 also still ships the
+# `app-server` subcommand our executor depends on. Bump only after
+# re-testing the executor against the new release's notification schema.
+RUN npm install -g @openai/codex@^0.57
 
 USER agent
 WORKDIR /home/agent

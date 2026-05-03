@@ -6,9 +6,10 @@ description: >-
   no fresh subprocess per turn.
 
   Default provider is OpenAI (set OPENAI_API_KEY). MiniMax is also
-  supported via the LiteLLM bridge — set MINIMAX_API_KEY and pick a
-  MiniMax model below; the runtime spawns a local Responses-API →
-  chat-completions proxy automatically.
+  supported natively — set MINIMAX_API_KEY and pick a MiniMax model
+  below; codex_minimax_config.sh writes the `wire_api = "chat"`
+  provider entry per MiniMax's official codex-cli docs, no proxy or
+  translator in the loop.
 version: 0.1.0
 tier: 2
 
@@ -36,14 +37,18 @@ runtime_config:
     - id: gpt-4o
       name: GPT-4o
       required_env: [OPENAI_API_KEY]
-    # MiniMax models — bridged via LiteLLM. Codex sees them as
-    # `codex-bridge` (rewritten by codex_bridge.sh in config.toml);
-    # this id surfaces the human-friendly model name in the canvas.
-    - id: MiniMax-M2
-      name: MiniMax-M2 (bridged)
+    # MiniMax models — codex points at MiniMax directly via the
+    # `[model_providers.minimax]` block written by
+    # codex_minimax_config.sh. Default (codex-MiniMax-M2.7) matches
+    # MiniMax's official codex-cli recommendation.
+    - id: codex-MiniMax-M2.7
+      name: codex-MiniMax-M2.7 (recommended)
       required_env: [MINIMAX_API_KEY]
     - id: MiniMax-M2.1
-      name: MiniMax-M2.1 (bridged)
+      name: MiniMax-M2.1
+      required_env: [MINIMAX_API_KEY]
+    - id: MiniMax-M2
+      name: MiniMax-M2
       required_env: [MINIMAX_API_KEY]
 
   # Per-model required_env (above) is the source of truth. The
