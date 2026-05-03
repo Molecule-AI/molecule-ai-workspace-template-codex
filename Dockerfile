@@ -38,7 +38,8 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY adapter.py executor.py app_server.py __init__.py ./
 COPY start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+COPY codex_bridge.sh /usr/local/bin/codex_bridge.sh
+RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/codex_bridge.sh
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to

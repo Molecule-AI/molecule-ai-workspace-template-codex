@@ -47,12 +47,35 @@ async def test_setup_raises_without_codex_binary(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_setup_raises_without_openai_api_key(monkeypatch):
+async def test_setup_raises_without_any_provider_key(monkeypatch):
+    """Neither OPENAI_API_KEY nor MINIMAX_API_KEY → fail fast."""
     monkeypatch.setattr("adapter.shutil.which", lambda _: "/usr/local/bin/codex")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     cfg = AdapterConfig(model="gpt-5")
-    with pytest.raises(RuntimeError, match="OPENAI_API_KEY is required"):
+    with pytest.raises(RuntimeError, match="Neither OPENAI_API_KEY nor MINIMAX_API_KEY"):
         await CodexAdapter().setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_with_openai_only(monkeypatch):
+    """OPENAI_API_KEY alone is enough (default OpenAI-direct path)."""
+    monkeypatch.setattr("adapter.shutil.which", lambda _: "/usr/local/bin/codex")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stub")
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    cfg = AdapterConfig(model="gpt-5")
+    await CodexAdapter().setup(cfg)  # no raise
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_with_minimax_only(monkeypatch):
+    """MINIMAX_API_KEY alone is enough — codex_bridge.sh routes via
+    LiteLLM and writes a sentinel OPENAI_API_KEY at runtime."""
+    monkeypatch.setattr("adapter.shutil.which", lambda _: "/usr/local/bin/codex")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-stub")
+    cfg = AdapterConfig(model="MiniMax-M2")
+    await CodexAdapter().setup(cfg)  # no raise
 
 
 @pytest.mark.asyncio
