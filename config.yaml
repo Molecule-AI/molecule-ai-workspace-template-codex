@@ -5,8 +5,10 @@ description: >-
   so A2A messages process in-order with full conversation continuity —
   no fresh subprocess per turn.
 
-  Provider is OpenAI (codex is OpenAI-only). Set OPENAI_API_KEY in the
-  workspace's environment via the canvas Config tab.
+  Default provider is OpenAI (set OPENAI_API_KEY). MiniMax is also
+  supported via the LiteLLM bridge — set MINIMAX_API_KEY and pick a
+  MiniMax model below; the runtime spawns a local Responses-API →
+  chat-completions proxy automatically.
 version: 0.1.0
 tier: 2
 
@@ -17,8 +19,10 @@ runtime_config:
   # default (currently gpt-5, but tracks codex CLI releases).
   model: gpt-5
 
-  # Models surfaced in the canvas Config tab dropdown. All require
-  # OPENAI_API_KEY since codex is OpenAI-only.
+  # Models surfaced in the canvas Config tab dropdown. OpenAI models
+  # use codex's default Responses provider; MiniMax models route via
+  # the LiteLLM bridge (codex_bridge.sh) — bridge auto-activates when
+  # MINIMAX_API_KEY is set, no manual switch needed.
   models:
     - id: gpt-5
       name: GPT-5
@@ -32,14 +36,26 @@ runtime_config:
     - id: gpt-4o
       name: GPT-4o
       required_env: [OPENAI_API_KEY]
+    # MiniMax models — bridged via LiteLLM. Codex sees them as
+    # `codex-bridge` (rewritten by codex_bridge.sh in config.toml);
+    # this id surfaces the human-friendly model name in the canvas.
+    - id: MiniMax-M2
+      name: MiniMax-M2 (bridged)
+      required_env: [MINIMAX_API_KEY]
+    - id: MiniMax-M2.1
+      name: MiniMax-M2.1 (bridged)
+      required_env: [MINIMAX_API_KEY]
 
-  # All codex models share this requirement.
-  required_env: [OPENAI_API_KEY]
+  # Per-model required_env (above) is the source of truth. The
+  # runtime_config-level required_env is intentionally empty — the
+  # adapter's setup() accepts either OPENAI_API_KEY or MINIMAX_API_KEY.
+  required_env: []
 
-  # Single-provider runtime; surfaced as the only entry in the canvas
-  # Provider dropdown.
+  # Two paths: openai (direct) + minimax (via LiteLLM bridge). Surfaced
+  # as the canvas Provider dropdown.
   providers:
     - openai
+    - minimax
 
   # 0 = no executor-side timeout. Per-turn timeout is enforced inside
   # executor.py at _TURN_TIMEOUT (currently 600s).

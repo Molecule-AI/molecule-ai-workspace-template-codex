@@ -20,18 +20,30 @@ fi
 CODEX_VERSION="$(codex --version 2>&1 || echo unknown)"
 echo "[start.sh] codex installed: ${CODEX_VERSION}"
 
-# OPENAI_API_KEY must be set (codex reads it from env). The adapter's
-# setup() also checks this and fails the workspace at preflight, but
-# surfacing it here gives operators a clearer signal in container logs.
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-  echo "[start.sh] WARN: OPENAI_API_KEY not set. Workspace will fail preflight." >&2
-fi
-
 # Pre-create ~/.codex so codex doesn't try to mkdir it on first run as
 # the wrong user. Persistent volume mount goes here for thread state.
 install -d -o agent -g agent /home/agent/.codex
 install -d -o agent -g agent /home/agent/.codex/sessions
 
+# Activate the LiteLLM bridge if a non-OpenAI provider key is present.
+# Sourced (not exec'd) so it can `export OPENAI_API_KEY=...` for codex.
+# When no alternate-provider key is set, the script returns early and
+# codex falls through to its default OpenAI behavior.
+if [ -f /usr/local/bin/codex_bridge.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex source /usr/local/bin/codex_bridge.sh
+elif [ -f /app/codex_bridge.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex source /app/codex_bridge.sh
+fi
+# Reapply ownership in case the bridge wrote into the agent's home as root.
+chown -R agent:agent /home/agent/.codex 2>/dev/null || true
+
+# Now check key. After the bridge sources, OPENAI_API_KEY is always
+# set (real OpenAI key for direct mode; sentinel placeholder for
+# bridge mode — LiteLLM doesn't enforce it without a master_key).
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "[start.sh] WARN: OPENAI_API_KEY not set and no alternate-provider key (e.g. MINIMAX_API_KEY) found. Workspace will fail preflight." >&2
+fi
+
 # Hand off to molecule-runtime. From here, every A2A message routes
 # through executor.py → app_server.py → codex app-server child.
-exec gosu agent molecule-runtime
+exec gosu -E agent molecule-runtime

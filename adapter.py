@@ -74,10 +74,24 @@ class CodexAdapter(BaseAdapter):
                 "outside the container, install it with: "
                 "`npm install -g @openai/codex`"
             )
-        if not os.environ.get("OPENAI_API_KEY"):
+        # Auth: codex defaults to OpenAI direct, which needs
+        # OPENAI_API_KEY. The opt-in LiteLLM bridge (codex_bridge.sh)
+        # lets the workspace point codex at a chat-completions provider
+        # like MiniMax — in that mode the operator sets MINIMAX_API_KEY
+        # instead, the bridge starts a litellm proxy + writes a fake
+        # OPENAI_API_KEY that satisfies codex's env_key requirement.
+        # Accept either credential here; the bridge script handles the
+        # actual provider routing.
+        if not (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("MINIMAX_API_KEY")
+        ):
             raise RuntimeError(
-                "OPENAI_API_KEY is required for the codex runtime. "
-                "Set it in the workspace's environment via the canvas "
+                "Neither OPENAI_API_KEY nor MINIMAX_API_KEY is set. "
+                "Codex needs at least one provider credential — set "
+                "OPENAI_API_KEY for direct OpenAI use, or "
+                "MINIMAX_API_KEY to route through the LiteLLM bridge "
+                "(see codex_bridge.sh). Configure via the canvas "
                 "Config tab."
             )
 
