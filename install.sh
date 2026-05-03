@@ -80,3 +80,16 @@ if [ -f "$SCRIPT_DIR/codex_minimax_config.sh" ]; then
   bash "$SCRIPT_DIR/codex_minimax_config.sh" || \
     echo "[install.sh] WARN: codex_minimax_config.sh exited non-zero — workspace may run on default provider" >&2
 fi
+
+# --- Bare-host molecule A2A MCP wiring -----------------------------
+# Append the [mcp_servers.molecule] block so the codex agent can call
+# list_peers / delegate_task / commit_memory etc. as MCP tools — same
+# capability claude-code agents get via claude_sdk_executor.py's
+# mcp_servers wiring. Must run AFTER codex_minimax_config.sh because
+# that script overwrites config.toml; this one appends. Tracks issue
+# Molecule-AI/molecule-ai-workspace-template-codex#15.
+if [ -f "$SCRIPT_DIR/codex_mcp_config.sh" ]; then
+  echo "[install.sh] running codex_mcp_config.sh (molecule A2A MCP wiring)"
+  bash "$SCRIPT_DIR/codex_mcp_config.sh" || \
+    echo "[install.sh] WARN: codex_mcp_config.sh exited non-zero — codex agent will boot without molecule A2A MCP tools" >&2
+fi

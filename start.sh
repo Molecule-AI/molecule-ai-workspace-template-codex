@@ -36,7 +36,21 @@ elif [ -f /app/codex_minimax_config.sh ]; then
   HOME=/home/agent CODEX_HOME=/home/agent/.codex \
     bash /app/codex_minimax_config.sh
 fi
-# Reapply ownership in case the helper wrote into agent's home as root.
+
+# Append the molecule A2A MCP server block — gives the codex agent
+# list_peers / delegate_task / commit_memory etc. as MCP tools (same
+# capability claude-code's mcp_servers["a2a"] wiring provides). Order
+# matters: codex_minimax_config.sh writes config.toml with `cat >`
+# (overwrite); this one uses `cat >>` (append) and so must run after.
+# Tracks issue molecule-ai-workspace-template-codex#15.
+if [ -f /usr/local/bin/codex_mcp_config.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    bash /usr/local/bin/codex_mcp_config.sh
+elif [ -f /app/codex_mcp_config.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    bash /app/codex_mcp_config.sh
+fi
+# Reapply ownership in case the helpers wrote into agent's home as root.
 chown -R agent:agent /home/agent/.codex 2>/dev/null || true
 
 # Provider preflight: at least one of OPENAI_API_KEY or MINIMAX_API_KEY
