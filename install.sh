@@ -45,12 +45,15 @@ if [ "$need_node20" = "true" ]; then
 fi
 
 # --- Install codex CLI globally ---
-# Pin matches the Dockerfile (^0.72). The codex app-server protocol is
-# experimental and breaks across minors; bump deliberately when
-# validating a new release.
+# Pin to ^0.57 to match the Dockerfile. MiniMax's official codex-cli
+# integration doc (https://platform.minimax.io/docs/token-plan/codex-cli)
+# explicitly flags compat issues with later versions and recommends
+# 0.57.0; 0.57 still ships the `app-server` subcommand the executor
+# depends on. Bump only after re-testing the executor against the new
+# release's notification schema.
 if ! command -v codex >/dev/null 2>&1; then
-  echo "[install.sh] installing @openai/codex@^0.72 globally..."
-  sudo npm install -g @openai/codex@^0.72
+  echo "[install.sh] installing @openai/codex@^0.57 globally..."
+  sudo npm install -g @openai/codex@^0.57
 fi
 
 # --- Verify ---
@@ -63,20 +66,3 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 1
 fi
 echo "[install.sh] codex ready: $(command -v codex) ($(codex --version 2>/dev/null || echo version-unknown))"
-
-# --- Bare-host bridge prep (no-op when activation key isn't set) -----
-# When MINIMAX_API_KEY (or a future alternate-provider key) is present,
-# codex_bridge.sh boots a litellm proxy at runtime. The runtime user
-# already has Python (molecule-runtime is Python), but `litellm[proxy]`
-# isn't a runtime dep — install it here so first-boot doesn't have to
-# pip install while the workspace is racing for online status.
-if [ -n "${MINIMAX_API_KEY:-}" ] || [ "${INSTALL_LITELLM_BRIDGE:-0}" = "1" ]; then
-  echo "[install.sh] alternate-provider key detected — installing litellm[proxy] for codex bridge"
-  if command -v pip3 >/dev/null 2>&1; then
-    pip3 install --quiet --user "litellm[proxy]>=1.51.0,<2" || \
-      pip3 install --quiet "litellm[proxy]>=1.51.0,<2" || \
-      echo "[install.sh] WARN: litellm install failed; bridge will not start" >&2
-  else
-    echo "[install.sh] WARN: pip3 not on PATH; bridge will not start at runtime" >&2
-  fi
-fi

@@ -1,10 +1,12 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
 molecule-ai-workspace-runtime>=0.1.0
 
-# litellm[proxy] — only loaded when codex_bridge.sh activates the
-# Responses-API → chat-completions translator (see codex_bridge.sh
-# header). Codex 0.72 supports `wire_api = "responses"` only, so
-# without this bridge the template requires a real OpenAI key.
-# Pinned to a known-stable release so model_providers updates don't
-# silently break the bridge.
-litellm[proxy]>=1.51.0,<2
+# No additional Python deps. The codex CLI is a Node.js binary
+# installed via npm in the Dockerfile; the executor talks to its
+# stdio app-server using only the asyncio + json modules from the
+# standard library.
+#
+# MiniMax provider is wired via a static config.toml written by
+# codex_minimax_config.sh — no proxy or translation layer needed
+# (codex 0.72's WireApi enum natively supports both `responses` and
+# `chat`; MiniMax uses `chat`).

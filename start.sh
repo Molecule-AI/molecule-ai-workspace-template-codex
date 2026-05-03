@@ -25,23 +25,25 @@ echo "[start.sh] codex installed: ${CODEX_VERSION}"
 install -d -o agent -g agent /home/agent/.codex
 install -d -o agent -g agent /home/agent/.codex/sessions
 
-# Activate the LiteLLM bridge if a non-OpenAI provider key is present.
-# Sourced (not exec'd) so it can `export OPENAI_API_KEY=...` for codex.
-# When no alternate-provider key is set, the script returns early and
-# codex falls through to its default OpenAI behavior.
-if [ -f /usr/local/bin/codex_bridge.sh ]; then
-  HOME=/home/agent CODEX_HOME=/home/agent/.codex source /usr/local/bin/codex_bridge.sh
-elif [ -f /app/codex_bridge.sh ]; then
-  HOME=/home/agent CODEX_HOME=/home/agent/.codex source /app/codex_bridge.sh
+# Generate the MiniMax provider config.toml when MINIMAX_API_KEY is
+# present. No-op when the operator is using OpenAI direct (the env
+# the codex CLI checks defaults to OPENAI_API_KEY in that path).
+# Source: https://platform.minimax.io/docs/token-plan/codex-cli
+if [ -f /usr/local/bin/codex_minimax_config.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    bash /usr/local/bin/codex_minimax_config.sh
+elif [ -f /app/codex_minimax_config.sh ]; then
+  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    bash /app/codex_minimax_config.sh
 fi
-# Reapply ownership in case the bridge wrote into the agent's home as root.
+# Reapply ownership in case the helper wrote into agent's home as root.
 chown -R agent:agent /home/agent/.codex 2>/dev/null || true
 
-# Now check key. After the bridge sources, OPENAI_API_KEY is always
-# set (real OpenAI key for direct mode; sentinel placeholder for
-# bridge mode — LiteLLM doesn't enforce it without a master_key).
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-  echo "[start.sh] WARN: OPENAI_API_KEY not set and no alternate-provider key (e.g. MINIMAX_API_KEY) found. Workspace will fail preflight." >&2
+# Provider preflight: at least one of OPENAI_API_KEY or MINIMAX_API_KEY
+# must be set. The adapter's setup() also checks but surfacing here
+# gives operators a clearer signal in container logs.
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MINIMAX_API_KEY:-}" ]; then
+  echo "[start.sh] WARN: neither OPENAI_API_KEY nor MINIMAX_API_KEY set. Workspace will fail preflight." >&2
 fi
 
 # Hand off to molecule-runtime. From here, every A2A message routes
