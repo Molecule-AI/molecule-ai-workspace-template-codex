@@ -1,0 +1,31 @@
+# .trivyignore — exclude HIGH-severity transitive CVEs that come from
+# upstream `@openai/codex@^0.57`'s bundled node_modules. We can't bump
+# them directly without forking the codex CLI; the next codex CLI
+# release should pick up newer transitives.
+#
+# Re-audit 2026-08-01 — by then OpenAI should have shipped at least
+# one codex CLI release picking up newer transitives. If still stuck:
+# investigate whether we can override via npm shrinkwrap or move to
+# install via a vendored package.json.
+#
+# Pinned by `--include-id-in-skip` style — Trivy matches CVE IDs
+# verbatim. molecule-ci#38 Phase-2 (option a — per-template ignore).
+
+# cross-spawn 7.0.3 — fixed in 7.0.5 (regular expression DoS)
+CVE-2024-21538
+
+# glob 10.4.2 — fixed in 10.5.0 (command injection via filenames)
+CVE-2025-64756
+
+# minimatch 9.0.5 — three CVEs, all in the same DoS-via-glob class
+CVE-2026-26996
+CVE-2026-27903
+CVE-2026-27904
+
+# tar 6.2.1 — six CVEs, file-overwrite + symlink/hardlink path traversal class
+CVE-2026-23745
+CVE-2026-23950
+CVE-2026-24842
+CVE-2026-26960
+CVE-2026-29786
+CVE-2026-31802
