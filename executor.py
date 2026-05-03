@@ -206,26 +206,49 @@ class CodexAppServerExecutor(AgentExecutor):
         loop = asyncio.get_running_loop()
 
         def on_notification(method: str, params: dict[str, Any]) -> None:
-            # Codex v2 protocol notifications. Only the message stream
-            # + completion + error map onto our flow today; everything
-            # else (reasoning, tool exec, token usage) is logged for
-            # observability but not surfaced to the A2A response.
+            # Codex app-server notifications. The schema is `experimental`
+            # and has shifted across releases — current codex 0.72 emits
+            # snake_case event names (`agent_message`, `task_complete`,
+            # `turn_aborted`); earlier codex 2.x emitted slash/dot forms
+            # (`turn/completed`). We accept both shapes so a codex bump
+            # doesn't strand the workspace silently with empty replies
+            # (caught live during the 2026-05-03 4-runtime A2A E2E:
+            # codex 0.72 returned empty text because executor only knew
+            # the old `turn/completed` + `agent_message_delta` names).
+            #
+            # Surfaced events:
+            #   - text deltas: `agent_message_delta` (chunk) and
+            #     `agent_message` (whole — fired when the model chose
+            #     not to stream chunks; we treat it as a final delta)
+            #   - completion: `task_complete` (0.72) /
+            #     `turn/completed` (older schemas)
+            #   - error/abort: `error_notification`, `turn_aborted`,
+            #     `stream_error`
+            # Other notifications (reasoning, tool exec, token usage)
+            # are debug-logged for observability but not surfaced.
             if method == "agent_message_delta":
                 delta = params.get("delta") or params.get("text") or ""
                 if delta:
                     state.deltas.append(delta)
-            elif method in ("turn/completed", "turn.completed"):
-                # Match either dotted or slashed form — schema is in
-                # flux during the experimental phase. Also tolerate
-                # both `turnId` (schema) and `id` (real binary) for
-                # the params id field.
-                tid = params.get("turnId") or params.get("id")
+            elif method == "agent_message":
+                # Whole-message form: codex emits this when the model
+                # response wasn't streamed as chunks. The full text
+                # lives under `message` (0.72) or `text`. Append it
+                # as a single delta so the assembled string is
+                # complete even when no `_delta` notifications fire.
+                msg = params.get("message") or params.get("text") or ""
+                if msg:
+                    state.deltas.append(msg)
+            elif method in ("turn/completed", "turn.completed", "task_complete"):
+                # Tolerate dotted / slashed / snake_case schema variants
+                # (codex changes these across minors). Also accept both
+                # `turnId` and `id` for the params id field.
+                tid = params.get("turnId") or params.get("id") or params.get("task_id")
                 if tid in (None, state.turn_id):
                     loop.call_soon_threadsafe(state.completed.set)
-            elif method == "error_notification":
-                state.error = RuntimeError(
-                    params.get("message", "unknown app-server error")
-                )
+            elif method in ("error_notification", "stream_error", "turn_aborted"):
+                msg = params.get("message") or params.get("error") or method
+                state.error = RuntimeError(str(msg))
                 loop.call_soon_threadsafe(state.completed.set)
             else:
                 logger.debug("codex notification: %s %s", method, params)

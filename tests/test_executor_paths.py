@@ -240,6 +240,52 @@ async def test_completed_dotted_form_also_completes_turn():
 
 
 @pytest.mark.asyncio
+async def test_codex072_snake_case_event_schema():
+    """codex 0.72 emits snake_case event names: `agent_message`
+    (whole reply, no streaming) + `task_complete` (instead of
+    `turn/completed`). Both must produce a populated text result —
+    pre-fix codex returned empty text because the executor only
+    knew the older slash/dot schema. Caught live during 2026-05-03
+    4-runtime A2A E2E."""
+    fake = FakeAppServer()
+    ex = _make(fake)
+
+    async def driver():
+        for _ in range(50):
+            if any(m == "turn/start" for m, _ in fake.requests):
+                break
+            await asyncio.sleep(0.01)
+        # Whole-message form (codex 0.72 when model didn't stream chunks)
+        fake.push("agent_message", {"message": "snake_case ok"})
+        fake.push("task_complete", {"task_id": "tu_1"})
+
+    driver_task = asyncio.create_task(driver())
+    text = await ex._run_turn("snake-case")
+    await driver_task
+    assert text == "snake_case ok"
+
+
+@pytest.mark.asyncio
+async def test_codex072_turn_aborted_surfaces_as_error():
+    """`turn_aborted` (codex 0.72) and `stream_error` map to the
+    same error path as the older `error_notification`."""
+    fake = FakeAppServer()
+    ex = _make(fake)
+
+    async def driver():
+        for _ in range(50):
+            if any(m == "turn/start" for m, _ in fake.requests):
+                break
+            await asyncio.sleep(0.01)
+        fake.push("turn_aborted", {"message": "user pressed Ctrl-C"})
+
+    driver_task = asyncio.create_task(driver())
+    with pytest.raises(RuntimeError, match="user pressed Ctrl-C"):
+        await ex._run_turn("aborted")
+    await driver_task
+
+
+@pytest.mark.asyncio
 async def test_unknown_notification_methods_are_logged_and_ignored(caplog):
     fake = FakeAppServer()
     ex = _make(fake)
