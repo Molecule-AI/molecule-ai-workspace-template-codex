@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# codex_mcp_config.sh — append the molecule A2A MCP server block to
+# ~/.codex/config.toml so the codex CLI can call list_peers /
+# delegate_task / commit_memory / recall_memory / send_message_to_user
+# / get_workspace_info / check_task_status as MCP tools.
+#
+# This is the codex equivalent of how claude_sdk_executor.py wires
+# `mcp_servers["a2a"]` into the claude-agent-sdk options for the
+# claude-code template. Without it, every codex workspace boots blind
+# to its peers and reports "list_peers not available" the first time
+# the agent tries to coordinate. Tracks issue
+# Molecule-AI/molecule-ai-workspace-template-codex#15.
+#
+# Schema reference (codex-rs rust-v0.57.0 docs/config.md, MCP section):
+#   [mcp_servers.<name>]
+#   command = "<binary>"
+#   args = ["..."]
+#   env = { "KEY" = "value" }   # extra env merged with codex's whitelist
+#   env_vars = ["EXTRA_FORWARD"] # additional env-passthrough names
+#
+# Codex's default env whitelist (codex-rs/rmcp-client/src/utils.rs)
+# covers HOME / PATH / LANG / TERM / TMPDIR / etc. but NOT the molecule-
+# specific runtime env (WORKSPACE_ID, PLATFORM_URL, MOLECULE_ORG_ID,
+# CONFIGS_DIR). We resolve them at install time and write literal
+# values into the env map so the MCP child process has them regardless
+# of how codex spawns it.
+#
+# Composition with codex_minimax_config.sh: that script uses `cat >`
+# (overwrite). This script uses `cat >>` (append) and MUST run AFTER
+# the minimax script — install.sh + start.sh both invoke them in that
+# order. Idempotent: re-running on an already-configured config.toml
+# strips the previous [mcp_servers.molecule] block before re-appending,
+# so reboots don't accumulate duplicate entries.
+
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+mkdir -p "$CODEX_HOME"
+CONFIG_TOML="${CODEX_HOME}/config.toml"
+
+# Resolve python interpreter at install time. Sandbox-spawned MCP
+# children may not inherit the same PATH as the parent shell, so the
+# absolute path is safer than relying on `python3` being resolvable
+# inside whatever sandbox codex spawns the child under.
+#
+# Prefer the runtime venv (`/opt/molecule-venv/bin/python3`) where
+# molecule-ai-workspace-runtime is installed by the host install.sh.
+# /usr/bin/python3 has only the system stdlib and no molecule_runtime,
+# so picking it here causes codex to fail the MCP handshake on first
+# call: "MCP client for `molecule` failed to start: handshaking with
+# MCP server failed: connection closed: initialize response" (the
+# subprocess crashes with ModuleNotFoundError before the JSON-RPC
+# handshake completes). Walk a list of well-known interpreters and
+# pick the first one that can `import molecule_runtime`.
+resolve_python() {
+  if [ -n "${MOLECULE_MCP_PYTHON:-}" ] && [ -x "${MOLECULE_MCP_PYTHON}" ]; then
+    echo "${MOLECULE_MCP_PYTHON}"
+    return
+  fi
+  for cand in /opt/molecule-venv/bin/python3 /opt/molecule-venv/bin/python \
+              "$(command -v python3 2>/dev/null)" "$(command -v python 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ] && \
+       "$cand" -c "import molecule_runtime" >/dev/null 2>&1; then
+      echo "$cand"
+      return
+    fi
+  done
+  # Last-resort fallback so the config is still well-formed; the
+  # MCP handshake will still fail at runtime, but at install time
+  # we surface a warning rather than aborting the whole boot.
+  echo "${MOLECULE_MCP_PYTHON:-/opt/molecule-venv/bin/python3}"
+}
+PYTHON_BIN="$(resolve_python)"
+if ! "$PYTHON_BIN" -c "import molecule_runtime" >/dev/null 2>&1; then
+  echo "[codex-mcp] WARNING: ${PYTHON_BIN} cannot import molecule_runtime;" \
+    "MCP handshake will fail at runtime. Install molecule-ai-workspace-runtime first." >&2
+fi
+
+# Resolve the platform-runtime env that the a2a_mcp_server reads on
+# startup. Fall back to the same defaults a2a_client.py uses so the
+# block is well-formed even when boot order leaves something unset.
+WORKSPACE_ID_VAL="${WORKSPACE_ID:-}"
+PLATFORM_URL_VAL="${PLATFORM_URL:-http://platform:8080}"
+MOLECULE_ORG_ID_VAL="${MOLECULE_ORG_ID:-}"
+
+# CONFIGS_DIR for the MCP child MUST resolve to the SAME directory the
+# runtime persists .auth_token into — otherwise the MCP subprocess
+# reads a different (empty) path, platform_auth.get_token() returns
+# None, and every list_peers / delegate_task call 401s with
+# "Authentication to platform failed" while the runtime itself is
+# fully authed. This is the codex instance of the Hermes
+# list_peers-401 / OpenClaw "MCP wired to the wrong thing" class
+# (RFC internal#456 §10).
+#
+# Root cause of the pre-fix bug: this script hard-defaulted
+# CONFIGS_DIR_VAL to "/configs" when CONFIGS_DIR was unset, then wrote
+# that literal into [mcp_servers.molecule.env]. configs_dir.resolve()
+# treats an explicit CONFIGS_DIR env as an UNCONDITIONAL override (no
+# writability check — molecule_runtime/configs_dir.py resolution
+# order, see molecule-core#2458), so the MCP child was pinned to
+# /configs even when the runtime had (correctly) fallen back to
+# $HOME/.molecule-workspace because /configs is root-owned + not
+# agent-writable in a fresh container. Result: token file at
+# ~/.molecule-workspace/.auth_token, MCP child looking at
+# /configs/.auth_token (absent) → 401 → "No peers found".
+#
+# Fix: ask configs_dir.resolve() itself (the single resolution point
+# the runtime uses) what directory it picks, and write THAT. Falls
+# back to an explicit operator CONFIGS_DIR if set, then to a literal
+# resolve() under the agent HOME so the value is always the one the
+# runtime's heartbeat + platform_auth actually use.
+_resolve_configs_dir() {
+  if [ -n "${CONFIGS_DIR:-}" ]; then
+    printf '%s\n' "${CONFIGS_DIR}"
+    return
+  fi
+  # Resolve via the runtime's own single-source-of-truth module, with
+  # HOME pinned to the agent home exactly as start.sh runs the helper
+  # (HOME=/home/agent). This returns /configs only when it exists AND
+  # is agent-writable, otherwise $HOME/.molecule-workspace — i.e. the
+  # identical path the runtime will write .auth_token into.
+  HOME="${HOME:-/home/agent}" "$PYTHON_BIN" - <<'PY' 2>/dev/null
+import molecule_runtime.configs_dir as c
+print(c.resolve())
+PY
+}
+CONFIGS_DIR_VAL="$(_resolve_configs_dir)"
+# Defensive: if resolve() produced nothing (e.g. runtime import broke),
+# fall back to the agent-home path rather than the root-owned /configs
+# so a degraded image still avoids the 401-by-misconfig trap.
+if [ -z "${CONFIGS_DIR_VAL}" ]; then
+  CONFIGS_DIR_VAL="${HOME:-/home/agent}/.molecule-workspace"
+fi
+
+# Strip any previous molecule MCP stanza(s) so re-running the script
+# every boot doesn't accumulate duplicates. We strip BOTH the parent
+# `[mcp_servers.molecule]` header and the `[mcp_servers.molecule.env]`
+# subtable header (TOML treats them as independent sections), plus any
+# leading auto-generated comment lines that immediately precede them.
+# Match from the header through the next [section] header or EOF.
+if [ -f "$CONFIG_TOML" ] && grep -qE '^\[mcp_servers\.molecule(\.|])' "$CONFIG_TOML"; then
+  awk '
+    # Buffer auto-generated comment lines so we can drop them when
+    # they precede a stripped header (they belong to the block).
+    /^# Auto-generated by codex_mcp_config\.sh/ { buf = buf $0 ORS; next }
+    /^# Provides list_peers/                    { buf = buf $0 ORS; next }
+    /^# tools to the codex agent/               { buf = buf $0 ORS; next }
+    /^\[mcp_servers\.molecule(\.|])/            { skip=1; buf=""; next }
+    skip && /^\[/                               { skip=0 }
+    !skip                                       { printf "%s", buf; buf=""; print }
+    END                                         { printf "%s", buf }
+  ' "$CONFIG_TOML" > "${CONFIG_TOML}.tmp" && mv "${CONFIG_TOML}.tmp" "$CONFIG_TOML"
+fi
+
+# Append the molecule MCP server block. We use double-equals key form
+# inside `env = { ... }` because that's the shape codex's docs/config.md
+# documents at rust-v0.57.0. Quoted keys are the safest cross-version
+# spelling. `env_vars` is the supplementary passthrough list — anything
+# the runtime later adds (MOLECULE_INBOUND_SECRET etc.) gets forwarded
+# automatically without a config change.
+cat >> "$CONFIG_TOML" <<EOF
+
+# Auto-generated by codex_mcp_config.sh — molecule A2A MCP server.
+# Provides list_peers / delegate_task / commit_memory / recall_memory
+# tools to the codex agent. See molecule_runtime/a2a_mcp_server.py.
+[mcp_servers.molecule]
+command = "${PYTHON_BIN}"
+args = ["-m", "molecule_runtime.a2a_mcp_server"]
+startup_timeout_sec = 30
+env_vars = ["MOLECULE_INBOUND_SECRET", "PLATFORM_INBOUND_SECRET", "PYTHONPATH"]
+
+[mcp_servers.molecule.env]
+WORKSPACE_ID = "${WORKSPACE_ID_VAL}"
+PLATFORM_URL = "${PLATFORM_URL_VAL}"
+MOLECULE_ORG_ID = "${MOLECULE_ORG_ID_VAL}"
+CONFIGS_DIR = "${CONFIGS_DIR_VAL}"
+EOF
+
+# Inherit ownership from the codex home dir so the agent user (which
+# runs molecule-runtime) can read the config under gosu.
+if command -v stat >/dev/null 2>&1; then
+  owner=$(stat -c "%u:%g" "$CODEX_HOME" 2>/dev/null || echo "")
+  if [ -n "$owner" ]; then
+    chown "$owner" "$CONFIG_TOML" 2>/dev/null || true
+  fi
+fi
+
+echo "[codex-mcp] wrote ${CONFIG_TOML} mcp_servers.molecule python=${PYTHON_BIN} workspace_id=${WORKSPACE_ID_VAL:-<unset>}"
