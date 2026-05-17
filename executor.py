@@ -135,6 +135,66 @@ class CodexAppServerExecutor(AgentExecutor):
             )
             return
 
+        # Push parity with claude-code: when a new message arrives while
+        # a turn is already in flight, inject it into the active turn
+        # via codex's `turn/steer` RPC instead of blocking on the lock
+        # for ~minutes until the prior turn finishes. This is the
+        # documented v2 codex app-server protocol primitive — see
+        # codex-rs/app-server/README.md§Steer-an-active-turn — and
+        # gives codex true mid-turn push semantics matching the
+        # `notifications/claude/channel` path Claude Code uses.
+        #
+        # The agent then sees the new prompt as additional input in the
+        # active turn's context. Per the molecule MCP server's
+        # instructions string, the agent replies via send_message_to_user
+        # (canvas) or delegate_task (peer) — the platform's reply path
+        # is tool-based, not the A2A response shape — so this execute()
+        # returning a placeholder is correct: the actual reply lands
+        # via the tool-call route, not through this event_queue.
+        if (
+            self._turn_lock.locked()
+            and self._app_server is not None
+            and self._thread_id is not None
+            and self._current_turn_id is not None
+        ):
+            try:
+                await self._app_server.request(
+                    "turn/steer",
+                    {
+                        "threadId": self._thread_id,
+                        "input": [{"type": "text", "text": prompt}],
+                        "expectedTurnId": self._current_turn_id,
+                    },
+                    timeout=5.0,
+                )
+                logger.info(
+                    "codex push: steered into active turn %s",
+                    self._current_turn_id,
+                )
+                # Status placeholder for the A2A response. The peer or
+                # canvas wrapper sees this; the agent's substantive
+                # reply comes via send_message_to_user / delegate_task
+                # MCP tool calls within the steered turn's response.
+                await event_queue.enqueue_event(
+                    new_text_message(
+                        "[steered into in-flight turn — agent will reply "
+                        "via send_message_to_user / delegate_task]"
+                    )
+                )
+                return
+            except (AppServerError, asyncio.TimeoutError) as exc:
+                # Steer failed — common causes:
+                #   - ActiveTurnNotSteerable (review/manual-compact turn)
+                #   - expectedTurnId mismatch (turn ended between our
+                #     locked-check and the steer request)
+                #   - app-server transport hiccup
+                # Fall through to the lock-and-wait path so the message
+                # still gets processed, just as a queued new turn.
+                logger.debug(
+                    "codex turn/steer failed (%s) — falling through to new-turn path",
+                    exc,
+                )
+
         async with self._turn_lock:
             try:
                 text = await self._run_turn(prompt)
@@ -159,6 +219,20 @@ class CodexAppServerExecutor(AgentExecutor):
                 await self._reset_app_server()
                 await event_queue.enqueue_event(
                     new_text_message(f"[codex unreachable] {exc!s}")
+                )
+                return
+            except RuntimeError as exc:
+                # Surfaced from `state.error` in `_run_turn` — codex emitted
+                # an `error` notification (typically an upstream HTTP failure
+                # from the model provider, e.g. `unexpected status 401
+                # Unauthorized`). Wrapping with the same `[codex error]`
+                # prefix the AppServerError path uses keeps the canvas-side
+                # behavior consistent: a clear inline message instead of a
+                # bare JSON-RPC -32603 leak from the a2a-sdk top-level
+                # handler.
+                logger.warning("codex turn surfaced error: %s", exc)
+                await event_queue.enqueue_event(
+                    new_text_message(f"[codex error] {exc}")
                 )
                 return
 
@@ -206,29 +280,84 @@ class CodexAppServerExecutor(AgentExecutor):
         loop = asyncio.get_running_loop()
 
         def on_notification(method: str, params: dict[str, Any]) -> None:
-            # Codex v2 protocol notifications. Only the message stream
-            # + completion + error map onto our flow today; everything
-            # else (reasoning, tool exec, token usage) is logged for
-            # observability but not surfaced to the A2A response.
-            if method == "agent_message_delta":
-                delta = params.get("delta") or params.get("text") or ""
+            # Codex 0.72 wraps all event notifications under a single
+            # `codex/event/<type>` JSON-RPC method, with the actual
+            # event under `params.msg` and `params.msg.type` carrying
+            # the event-type tag. There's a parallel set of bare
+            # methods (`item/started`, `turn/started`, `error`) that
+            # mirror a subset for legacy clients — we ignore those
+            # and read the canonical `codex/event/*` stream.
+            #
+            # Captured live by running `codex app-server` directly
+            # against a fresh thread (2026-05-03). Pre-fix the
+            # executor matched on `agent_message_delta` /
+            # `turn/completed` directly as the JSON-RPC method, which
+            # never fires in codex 0.72 — every probe returned empty
+            # text + the workspace looked healthy.
+            #
+            # Surfaced events (msg.type values):
+            #   - agent_message_delta — streamed chunk (delta)
+            #   - agent_message       — whole reply (when model didn't stream)
+            #   - task_complete       — turn finished cleanly
+            #   - error               — fatal turn error
+            # Reasoning / item / tool events are debug-logged.
+            if method == "error":
+                # Bare-method `error` notifications (parallel schema)
+                # carry the error payload under `params.error`. These
+                # often duplicate a `codex/event/stream_error` —
+                # surface only the final non-retry one so the operator
+                # sees the real failure.
+                err = params.get("error") or {}
+                if not params.get("willRetry"):
+                    state.error = RuntimeError(
+                        str(err.get("message") or "unknown codex error")
+                    )
+                    loop.call_soon_threadsafe(state.completed.set)
+                return
+
+            if not method.startswith("codex/event/"):
+                logger.debug("codex notification: %s %s", method, params)
+                return
+
+            msg = params.get("msg") or {}
+            mtype = msg.get("type", "")
+            if mtype == "agent_message_delta":
+                delta = msg.get("delta") or msg.get("text") or ""
                 if delta:
                     state.deltas.append(delta)
-            elif method in ("turn/completed", "turn.completed"):
-                # Match either dotted or slashed form — schema is in
-                # flux during the experimental phase. Also tolerate
-                # both `turnId` (schema) and `id` (real binary) for
-                # the params id field.
-                tid = params.get("turnId") or params.get("id")
-                if tid in (None, state.turn_id):
-                    loop.call_soon_threadsafe(state.completed.set)
-            elif method == "error_notification":
+            elif mtype == "agent_message":
+                # Whole-message form: codex emits this when the model
+                # response wasn't streamed as chunks (most non-OpenAI
+                # backends). Append as a single delta so the assembled
+                # string is complete even without `_delta` fragments.
+                whole = msg.get("message") or msg.get("text") or ""
+                if whole:
+                    state.deltas.append(whole)
+            elif mtype == "task_complete":
+                # task_complete carries `last_agent_message` — when
+                # the model returned a single message and skipped
+                # streaming, this is the only place the text shows
+                # up. Treat it as a final delta if we haven't seen
+                # an `agent_message` already (idempotent dedupe).
+                last = msg.get("last_agent_message") or ""
+                if last and last not in state.deltas:
+                    state.deltas.append(last)
+                loop.call_soon_threadsafe(state.completed.set)
+            elif mtype == "error":
                 state.error = RuntimeError(
-                    params.get("message", "unknown app-server error")
+                    str(msg.get("message") or "unknown codex error")
                 )
                 loop.call_soon_threadsafe(state.completed.set)
+            elif mtype == "stream_error":
+                # Retry signal — codex retries internally. Log it
+                # but don't surface; the final `error` (or
+                # task_complete) will resolve the turn.
+                logger.info(
+                    "codex stream_error (will retry): %s",
+                    msg.get("message", "")
+                )
             else:
-                logger.debug("codex notification: %s %s", method, params)
+                logger.debug("codex event: %s %s", mtype, msg)
 
         unsubscribe = self._app_server.subscribe(on_notification)
         try:

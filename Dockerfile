@@ -5,8 +5,30 @@ FROM python:3.11-slim
 #   git           — codex's agent tools use git
 #   gosu          — drop privileges in start.sh
 #   xz-utils      — Node tarball is .tar.xz
+#
+# T4 escalation leg (RFC internal#456 §9 / PR#474 — mirrors the
+# already-live-verified claude-code template image, commit 12dd604,
+# and the in-flight hermes PR#26 / openclaw PR#19):
+#   sudo + util-linux(nsenter) + docker.io(CLI) are baked here so the
+#   uid-1000 `agent` (see useradd below — UNCHANGED, agent stays
+#   uid-1000; start.sh still `exec gosu agent`) has a wired, audited
+#   path to host root inside the provisioner's `--privileged
+#   --pid=host -v /:/host -v /var/run/docker.sock:/var/run/docker.sock`
+#   container. Without sudo, a uid-1000 process in --privileged CANNOT
+#   nsenter/chroot /host (--privileged grants caps to root, not
+#   uid-1000) and cannot use the root:docker 0660 docker.sock — T4
+#   would be provisioner-shape-only (the documented ABSENT-escalation
+#   -leg gap; the codex prod pin sha256:877e0687 / git 99e7f13 is the
+#   2026-05-06 ECR-mirror rollback that PREDATES all T4 work and ships
+#   NO leg). The sudoers drop-in + docker-group add are below, after
+#   useradd, so `agent` exists. This is ADDITIVE: it does NOT change
+#   the agent uid and does NOT change token ownership. The codex MCP
+#   list_peers-401 token-resolution class (RFC internal#456 §10) is
+#   fixed atomically in the SAME image revision via codex_mcp_config.sh
+#   + start.sh's `chown -R agent:agent /configs`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates git gosu xz-utils \
+    sudo util-linux docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 LTS via NodeSource (codex CLI requires Node ≥20).
@@ -14,10 +36,33 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root agent user. codex stores sessions under ~/.codex/sessions/
-# so /home/agent should be a persistent volume in production
-# deployments to keep thread state across workspace restarts.
+# Non-root agent user — UNCHANGED. codex stores sessions under
+# ~/.codex/sessions/ so /home/agent should be a persistent volume in
+# production deployments to keep thread state across workspace
+# restarts. The agent runs as uid-1000; the T4 escalation leg below is
+# additive and does NOT promote the agent to root.
 RUN useradd -u 1000 -m -s /bin/bash agent
+
+# --- T4 escalation leg (RFC internal#456 §9.3 / PR#474) ---
+# Wired path: uid-1000 agent -> host root inside the provisioner's
+# --privileged --pid=host -v /:/host -v docker.sock container.
+#   1. NOPASSWD sudoers drop-in (mode 0440, visudo-validated at build
+#      so a malformed sudoers can never ship a broken-sudo image).
+#   2. agent in the `docker` group so the bind-mounted root:docker
+#      0660 /var/run/docker.sock is usable without sudo.
+# Atomic co-sequencing (RFC §10): this ships in the SAME image
+# revision as the uid-1000 + agent-owned-token start.sh contract and
+# the codex_mcp_config.sh CONFIGS_DIR resolution fix; the Layer-3
+# conformance gate asserts BOTH host-root reach AND agent-owned token
+# on the running container. Mirrors claude-code template image
+# (12dd604, already live-verified) verbatim.
+RUN set -eux; \
+    printf 'agent ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/agent-t4; \
+    chmod 0440 /etc/sudoers.d/agent-t4; \
+    visudo -cf /etc/sudoers.d/agent-t4; \
+    groupadd -f docker; \
+    usermod -aG docker agent; \
+    id agent
 
 WORKDIR /app
 
@@ -41,14 +86,26 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY adapter.py executor.py app_server.py __init__.py ./
 COPY start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+# Provider/MCP config helpers — invoked by start.sh on every boot.
+# codex_minimax_config.sh writes ~/.codex/config.toml (MiniMax provider
+# routing); codex_mcp_config.sh appends the molecule A2A MCP server
+# block (list_peers / delegate_task / commit_memory) and resolves the
+# correct CONFIGS_DIR so the MCP child reads the same .auth_token the
+# runtime writes (the list_peers-401 fix). start.sh probes both
+# /usr/local/bin and /app — install to /usr/local/bin (the primary).
+COPY codex_minimax_config.sh codex_mcp_config.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start.sh \
+             /usr/local/bin/codex_minimax_config.sh \
+             /usr/local/bin/codex_mcp_config.sh
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
-# both root and the agent user). Pin to a known-tested version range
-# — codex's app-server protocol is `experimental` and breaks across
-# minor versions. Bump deliberately when validating a new release.
-RUN npm install -g @openai/codex@^0.72
+# both root and the agent user). Pinned to the 0.57 line — the exact
+# release range proven working in the live-verified prod image
+# (codex-cli 0.57.0; MiniMax `chat` WireApi + app-server protocol).
+# codex's app-server protocol is `experimental` and breaks across
+# minor versions — bump deliberately when validating a new release.
+RUN npm install -g @openai/codex@~0.57
 
 USER agent
 WORKDIR /home/agent
@@ -60,5 +117,8 @@ ENV ADAPTER_MODULE=adapter \
 
 # start.sh is intentionally minimal — codex doesn't need a separate
 # daemon to boot; the app-server is a stdio child spawned by
-# executor.py on the first A2A turn.
+# executor.py on the first A2A turn. start.sh also generates the
+# MiniMax provider config + molecule MCP block and (as root, before
+# the gosu drop) makes /configs agent-owned so the runtime AND the MCP
+# child resolve the same agent-owned .auth_token.
 ENTRYPOINT ["/usr/local/bin/start.sh"]

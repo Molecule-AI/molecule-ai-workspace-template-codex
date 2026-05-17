@@ -5,3 +5,11 @@ molecule-ai-workspace-runtime>=0.1.0
 # installed via npm in the Dockerfile; the executor talks to its
 # stdio app-server using only the asyncio + json modules from the
 # standard library.
+#
+# MiniMax provider is wired via a static config.toml written by
+# codex_minimax_config.sh — no proxy or translation layer needed
+# (codex 0.57's WireApi enum natively supports both `responses` and
+# `chat`; MiniMax uses `chat`). The Dockerfile pins @openai/codex
+# to ~0.57 — the exact release line live-verified in prod (the
+# app-server protocol is `experimental` and breaks across minors;
+# bump deliberately when validating a new release).

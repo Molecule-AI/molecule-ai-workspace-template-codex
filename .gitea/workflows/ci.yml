@@ -1,0 +1,293 @@
+name: CI
+
+# Codex workspace template CI — ported verbatim in shape from the
+# live-verified claude-code template ci.yml (commit bbc2dae / PR#25)
+# and the in-flight hermes PR#26 / openclaw PR#19. The codex repo had
+# NO .gitea/workflows at all before this (single-commit stale mirror;
+# the deployed prod image sha256:877e0687 / git 99e7f13 was built
+# pre-suspension from GitHub and never rebuilt post-suspension because
+# this pipeline did not exist). This file adds the missing pipeline.
+#
+# Gitea 1.22.6 hostile-shape checklist applied (same as siblings):
+#   - No `workflow_dispatch.inputs` (silently rejected on 1.22.6)
+#   - No `merge_group:` trigger
+#   - No cross-repo `uses:` (DEFAULT_ACTIONS_URL=github 404s — the
+#     canonical validator is git-cloned fresh instead;
+#     feedback_gitea_cross_repo_uses_blocked)
+#   - workflow-level GITHUB_SERVER_URL pinned
+#     (feedback_act_runner_github_server_url)
+#   - No `on.push.paths:` (would permanently block path-excluded pushes;
+#     feedback_path_filtered_workflow_cant_be_required)
+#   - timeout-minutes on every job
+#   - A single `validate` aggregator emits the required-check name with
+#     a job that ALWAYS runs (feedback_branch_protection_check_name_parity)
+#
+# Cross-links:
+#   - RFC internal#456 §9-11 — T4 escalation leg + tier-4 conformance
+#   - molecule-ai/molecule-ci/scripts/validate-workspace-template.py — pattern source
+#   - claude-code template ci.yml (bbc2dae) — Gitea port style reference
+
+on: [push, pull_request]
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+# Defense-in-depth on GITHUB_TOKEN scope. validate-runtime +
+# t4-conformance run untrusted-by-design code (pip-install, adapter
+# import, docker build/run of the PR's Dockerfile). `contents: read`
+# means the worst a malicious template PR can do with the token is
+# read public repo state.
+permissions:
+  contents: read
+
+jobs:
+  validate-static:
+    name: Template validation (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Secret scan — most important check. Always runs, including on
+      # fork PRs (no third-party code executes here).
+      - name: Check for secrets
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, sys
+          from pathlib import Path
+
+          PATTERNS = [
+              re.compile(r'''["']sk-ant-[a-zA-Z0-9]{50,}["']'''),
+              re.compile(r'''["']ghp_[a-zA-Z0-9]{36,}["']'''),
+              re.compile(r'''["']AKIA[A-Z0-9]{16}["']'''),
+              re.compile(r'''["'][a-zA-Z0-9/+=]{40}["']'''),
+              re.compile(r'''["']sk_test_[a-zA-Z0-9]{24,}["']'''),
+              re.compile(r'''["']sk-proj-[a-zA-Z0-9_-]{20,}["']'''),
+              re.compile(r'''["']Bearer\s+[a-zA-Z0-9_.-]{20,}["']'''),
+              re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
+              re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
+          ]
+          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh', '.toml'}
+
+          def is_false_positive(line):
+              ctx = line.lower()
+              return '...' in ctx or '<example' in ctx or '</example' in ctx
+
+          root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
+          warnings = []
+          for dirpath, dirnames, filenames in os.walk(root):
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for filename in filenames:
+                  if Path(filename).suffix not in EXTENSIONS:
+                      continue
+                  filepath = Path(dirpath) / filename
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          for lineno, line in enumerate(f.readlines(), 1):
+                              for pattern in PATTERNS:
+                                  for match in pattern.finditer(line):
+                                      if not is_false_positive(line):
+                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
+                  except Exception:
+                      pass
+
+          if warnings:
+              print("::error::Potential secret found in committed files:")
+              for w in warnings:
+                  print(w)
+              sys.exit(1)
+          else:
+              print("::notice::No secrets detected")
+          PYEOF
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+      # Shell lint the boot + provider/MCP helper scripts. These are
+      # the load-bearing scripts for the codex list_peers-401 fix and
+      # the agent-owned-token contract — a syntax slip here would ship
+      # an image that boots blind to peers. Non-fatal style nits are
+      # tolerated (-S error) but real errors fail static.
+      - name: ShellCheck boot + provider helpers
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S error start.sh codex_minimax_config.sh codex_mcp_config.sh
+
+  validate-runtime:
+    name: Template validation (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+      - run: pip install pyyaml -q
+      - if: hashFiles('requirements.txt') != ''
+        run: pip install -q -r requirements.txt
+      - if: hashFiles('requirements.txt') == ''
+        run: pip install -q molecule-ai-workspace-runtime
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Docker build smoke test
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
+            exit 0
+          fi
+          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+
+  # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
+  # NOT a string-match. Builds the actual image, runs it under the
+  # EXACT flags the controlplane provisioner emits for tier-4
+  # (userdata_containerized.go @ec2384c: --privileged --pid=host
+  # -v /:/host -v /var/run/docker.sock:/var/run/docker.sock), then
+  # asserts BOTH properties on the RUNNING container, atomically
+  # (RFC §10 — either failing fails the build):
+  #   (a) the uid-1000 agent can attain host root
+  #       (sudo nsenter --target 1 --mount --pid -- id -u == 0)
+  #   (b) the codex MCP child resolves an agent-owned .auth_token
+  #       (the list_peers-401 class — RFC internal#456 §10). We assert
+  #       this on the REAL boot path: run start.sh's /configs chown,
+  #       then have configs_dir.resolve() (under the MCP child's env,
+  #       i.e. with the CONFIGS_DIR codex_mcp_config.sh would write)
+  #       point at an agent-owned token file — exactly what the codex
+  #       MCP subprocess does before calling list_peers.
+  t4-conformance:
+    name: T4 tier-4 conformance (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build the runtime image
+        id: build
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+            exit 1
+          fi
+          docker build -t t4-conformance-test . --no-cache 2>&1 | tail -5
+      - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND MCP token agent-ownership
+        run: |
+          set -euo pipefail
+          # EXACT flags from controlplane userdata_containerized.go
+          # (tier-4 emission @ec2384c). Override the entrypoint with a
+          # sleep so we can probe the agent context directly.
+          CID=$(docker run -d \
+            --name t4probe \
+            --network host \
+            --privileged \
+            --pid=host \
+            -v /:/host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --entrypoint /bin/sh \
+            t4-conformance-test -c 'sleep 600')
+          trap 'docker rm -f t4probe >/dev/null 2>&1 || true' EXIT
+
+          echo "=== Reproduce the agent-owned-token half of the REAL boot path ==="
+          # start.sh (as root, pre-gosu) chowns /configs to agent so
+          # configs_dir.resolve() picks /configs for BOTH the runtime
+          # and the codex MCP child. Reproduce that exact step, then
+          # assert the codex MCP child (which resolves CONFIGS_DIR via
+          # codex_mcp_config.sh's resolve()-based logic) lands on an
+          # AGENT-OWNED token file — not a root-owned/absent one (the
+          # pre-fix list_peers-401 trap).
+          docker exec t4probe sh -c 'mkdir -p /configs && touch /configs/.auth_token && chown -R agent:agent /configs'
+
+          echo "=== (b) codex MCP child token-resolution: configs_dir.resolve() under agent + owner_uid ==="
+          # Resolve the configs dir the SAME way codex_mcp_config.sh
+          # does (configs_dir.resolve() with HOME=/home/agent), as the
+          # agent user, then stat the .auth_token it would read.
+          RESOLVED=$(docker exec -u agent -e HOME=/home/agent t4probe \
+            python3 -c 'import molecule_runtime.configs_dir as c; print(c.resolve())')
+          echo "MCP child resolves configs dir = $RESOLVED"
+          OWNER_UID=$(docker exec -u agent t4probe stat -c '%u' "$RESOLVED/.auth_token")
+          echo "owner_uid of $RESOLVED/.auth_token = $OWNER_UID"
+          if [ "$OWNER_UID" != "1000" ]; then
+            echo "::error::T4 contract violated: codex MCP child would resolve token at $RESOLVED/.auth_token owned by uid=$OWNER_UID (expected 1000). This is the codex list_peers-401 class (RFC internal#456 §10) — the MCP subprocess cannot read the agent-owned token and every list_peers/delegate_task 401s."
+            exit 1
+          fi
+
+          echo "=== (a) host-root reach AS THE uid-1000 AGENT (not root) ==="
+          AGENT_HOSTROOT_UID=$(docker exec -u agent t4probe sudo -n nsenter --target 1 --mount --pid -- id -u)
+          echo "agent->host-root id -u = $AGENT_HOSTROOT_UID"
+          if [ "$AGENT_HOSTROOT_UID" != "0" ]; then
+            echo "::error::T4 contract violated: uid-1000 agent could NOT attain host root via 'sudo nsenter --target 1' (got uid=$AGENT_HOSTROOT_UID). T4 escalation leg ABSENT/broken."
+            exit 1
+          fi
+          # Defense-in-depth: host-fs write+readback through /host from
+          # the agent, proving real host reach (not a namespace trick).
+          MARKER="t4-conformance-$(date +%s)-$RANDOM"
+          docker exec -u agent t4probe sudo -n sh -c "echo $MARKER > /host/tmp/.t4-conformance-probe"
+          READBACK=$(docker exec -u agent t4probe sudo -n cat /host/tmp/.t4-conformance-probe)
+          docker exec -u agent t4probe sudo -n rm -f /host/tmp/.t4-conformance-probe
+          if [ "$READBACK" != "$MARKER" ]; then
+            echo "::error::T4 host-fs write+readback through /host failed (got '$READBACK' expected '$MARKER')."
+            exit 1
+          fi
+          echo "::notice::T4 tier-4 conformance PASS — uid-1000 agent reaches host root AND the codex MCP child resolves an agent-owned .auth_token (both, atomically)."
+
+  # Aggregator that emits a single `validate` check name — this is the
+  # required-check context set on branch protection (the codex repo's
+  # BP had enable_status_check:true + empty contexts list, which blocks
+  # ALL merges per feedback_gitea_empty_status_check_contexts_blocks_merge;
+  # branch protection is updated to require `validate` alongside this).
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    needs: [validate-static, validate-runtime, t4-conformance]
+    if: always()
+    timeout-minutes: 1
+    steps:
+      - name: Aggregate
+        run: |
+          static="${{ needs.validate-static.result }}"
+          runtime="${{ needs.validate-runtime.result }}"
+          t4="${{ needs.t4-conformance.result }}"
+          echo "validate-static:  $static"
+          echo "validate-runtime: $runtime"
+          echo "t4-conformance:   $t4"
+          if [ "$static" != "success" ]; then
+            echo "::error::validate-static did not succeed: $static"
+            exit 1
+          fi
+          if [ "$runtime" != "success" ] && [ "$runtime" != "skipped" ]; then
+            echo "::error::validate-runtime did not succeed: $runtime"
+            exit 1
+          fi
+          # T4 conformance is a HARD gate on internal (non-fork) PRs
+          # and main pushes. `skipped` is only acceptable on fork PRs
+          # (the `if:` fork guard short-circuits it). Any other
+          # non-success fails the build: "verified" T4 requires this
+          # live gate green, never inference.
+          if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
+            echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / codex MCP token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
+            exit 1
+          fi
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4)"
+
+  tests:
+    name: Adapter unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pytest pytest-asyncio pyyaml
+      # Tests under tests/ exercise the executor turn lifecycle +
+      # app_server JSON-RPC plumbing against a mock codex binary; they
+      # do not need molecule_runtime importable at collection time.
+      - run: python3 -m pytest tests/ -v
