@@ -46,7 +46,7 @@ echo "----- start.sh boot $(date -u +%Y-%m-%dT%H:%M:%SZ) -----"
 echo "uid=$(id -u) gid=$(id -g) user=$(id -un 2>/dev/null || echo unknown)"
 echo "workspace_id=${WORKSPACE_ID:-<unset>} platform_url=${PLATFORM_URL:-<unset>}"
 echo "configs_dir: $(ls -ld /configs 2>/dev/null || echo MISSING)"
-for var in OPENAI_API_KEY MINIMAX_API_KEY KIMI_API_KEY MOLECULE_ORG_ID; do
+for var in OPENAI_API_KEY MINIMAX_API_KEY KIMI_API_KEY CODEX_AUTH_JSON CODEX_CHATGPT_AUTH_JSON MOLECULE_ORG_ID; do
   eval "val=\${$var:-}"
   if [ -n "${val:-}" ]; then echo "env $var=set"; else echo "env $var=unset"; fi
 done
@@ -93,30 +93,45 @@ elif [ -f /app/codex_mcp_config.sh ]; then
   HOME=/home/agent CODEX_HOME=/home/agent/.codex \
     bash /app/codex_mcp_config.sh
 fi
-# --- Mode C: headless ChatGPT-subscription auth (single-runner only) ---
-# When CODEX_CHATGPT_AUTH_JSON is set (the CONTENTS of a codex
-# `auth.json`, auth_mode:chatgpt, injected via the workspace Config tab
-# secret for EXACTLY ONE runner — the future combined Reviewer+
-# Researcher box on the CTO's ChatGPT subscription), write it to
-# $CODEX_HOME/auth.json so codex authenticates off the subscription
-# instead of OPENAI_API_KEY. Codex's documented headless refresh
-# (refresh-and-retry on 401, rewrites auth.json in place) handles token
-# rotation; the persistent /home/agent volume keeps the refreshed file.
-# We deliberately add NO refresh daemon — OpenAI's supported CI/CD
-# pattern is "run codex and persist the updated auth.json", not a
-# manual refresh endpoint (RFC §5).
+# --- Mode C: headless ChatGPT/Codex-subscription auth (single-runner) ---
+# Canonical credential: CODEX_AUTH_JSON. This is the CONTENTS of a
+# codex `auth.json` (auth_mode:"chatgpt", OPENAI_API_KEY:null,
+# tokens:{id_token,access_token,refresh_token,account_id},
+# last_refresh) — the OpenClaw `openai-codex` provider's auth.order
+# pattern (docs.openclaw.ai/providers/openai): prefer an injected
+# subscription auth.json over a pay-as-you-go API key. The blob is
+# stored in the self-hosted Infisical SSOT at secret path
+# `/shared/codex-oauth`, key `CODEX_AUTH_JSON` (env=prod), and is
+# injected into the workspace container as the CODEX_AUTH_JSON env
+# var via the workspace Config-tab secret binding for EXACTLY ONE
+# runner (the combined Reviewer+Researcher box on the CTO's
+# ChatGPT/Codex subscription).
 #
-# Inert when CODEX_CHATGPT_AUTH_JSON is unset: the OPENAI_API_KEY and
-# MiniMax paths above are byte-unchanged. This is SINGLE-RUNNER only;
-# there is intentionally no multi-workspace credential fanout (RFC §5,
-# §8) — one auth.json per runner, never shared across concurrent jobs.
-if [ -n "${CODEX_CHATGPT_AUTH_JSON:-}" ]; then
+# CODEX_CHATGPT_AUTH_JSON is accepted as a DOCUMENTED backward-compat
+# alias (the name shipped by template PR #5). CODEX_AUTH_JSON wins if
+# both are set, so a Config-tab override can shadow a stale alias.
+#
+# Writing it to $CODEX_HOME/auth.json makes codex authenticate off the
+# subscription instead of OPENAI_API_KEY. Codex's documented headless
+# refresh (refresh-and-retry on 401, rewrites auth.json in place)
+# handles token rotation; the persistent /home/agent volume keeps the
+# refreshed file. We deliberately add NO refresh daemon — OpenAI's
+# supported CI/CD pattern is "run codex and persist the updated
+# auth.json", not a manual refresh endpoint (RFC §5).
+#
+# Inert when neither var is set: the OPENAI_API_KEY and MiniMax paths
+# above are byte-unchanged and remain the DOCUMENTED FALLBACK. This is
+# SINGLE-RUNNER only; there is intentionally no multi-workspace
+# credential fanout (RFC §5, §8) — one auth.json per runner, never
+# shared across concurrent jobs. The token is never echoed.
+CODEX_AUTH_BLOB="${CODEX_AUTH_JSON:-${CODEX_CHATGPT_AUTH_JSON:-}}"
+if [ -n "${CODEX_AUTH_BLOB}" ]; then
   CODEX_HOME_DIR="/home/agent/.codex"
   install -d -o agent -g agent "$CODEX_HOME_DIR"
   AUTH_JSON_PATH="${CODEX_HOME_DIR}/auth.json"
   # Write the injected contents verbatim. printf %s avoids any
   # interpretation of backslashes/format chars in the token blob.
-  printf '%s' "${CODEX_CHATGPT_AUTH_JSON}" > "$AUTH_JSON_PATH"
+  printf '%s' "${CODEX_AUTH_BLOB}" > "$AUTH_JSON_PATH"
   chown agent:agent "$AUTH_JSON_PATH"
   chmod 0600 "$AUTH_JSON_PATH"
   # Ensure codex reads file-backed credentials (not the OS keyring,
