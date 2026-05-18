@@ -83,10 +83,17 @@ class CodexAdapter(BaseAdapter):
         #   A. OPENAI_API_KEY  — direct OpenAI path (codex default).
         #   B. MINIMAX_API_KEY — MiniMax chat-wire route
         #      (codex_minimax_config.sh writes config.toml).
-        #   C. $CODEX_HOME/auth.json — an injected
-        #      ChatGPT-subscription credential (auth_mode:chatgpt),
-        #      written by start.sh from CODEX_CHATGPT_AUTH_JSON for a
-        #      SINGLE runner. Codex prefers auth.json over env keys.
+        #   C. $CODEX_HOME/auth.json — an injected ChatGPT/Codex
+        #      -subscription credential (auth_mode:"chatgpt"),
+        #      materialized by start.sh from the CODEX_AUTH_JSON env
+        #      var (Infisical SSOT /shared/codex-oauth, key
+        #      CODEX_AUTH_JSON, env=prod; CODEX_CHATGPT_AUTH_JSON is a
+        #      backward-compat alias) for a SINGLE runner. This mirrors
+        #      OpenClaw's openai-codex auth.order: prefer an injected
+        #      subscription auth.json over the pay-as-you-go API key.
+        #      Codex prefers auth.json over env keys. The
+        #      OPENAI_API_KEY path (A) is retained as the documented
+        #      fallback and is intentionally NOT removed.
         # CODEX_HOME defaults to ~/.codex; honor an explicit override
         # so a non-default home is still detected.
         codex_home = os.environ.get("CODEX_HOME") or os.path.join(
@@ -103,10 +110,10 @@ class CodexAdapter(BaseAdapter):
                 "No codex credential found. Codex needs exactly one "
                 "of: OPENAI_API_KEY (direct OpenAI), MINIMAX_API_KEY "
                 "(MiniMax chat-wire route), or an injected "
-                "ChatGPT-subscription auth.json at "
-                f"{auth_json} (set CODEX_CHATGPT_AUTH_JSON for a "
-                "single-runner workspace). Configure via the canvas "
-                "Config tab."
+                "ChatGPT/Codex-subscription auth.json at "
+                f"{auth_json} (set CODEX_AUTH_JSON — the Infisical "
+                "/shared/codex-oauth credential — for a single-runner "
+                "workspace). Configure via the canvas Config tab."
             )
 
     async def create_executor(self, config: AdapterConfig):

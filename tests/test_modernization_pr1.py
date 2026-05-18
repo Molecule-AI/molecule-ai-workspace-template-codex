@@ -11,8 +11,10 @@ Three groups:
   2. adapter.setup() accepts auth.json as a third credential (mode C)
      and still fails closed when nothing is set.
   3. start.sh writes/omits ~/.codex/auth.json + config.toml keys
-     correctly based on CODEX_CHATGPT_AUTH_JSON (structural; mode C is
-     verified structurally only — we do not hold a real CTO auth.json).
+     correctly based on CODEX_AUTH_JSON (canonical Infisical key) and
+     its CODEX_CHATGPT_AUTH_JSON backward-compat alias (structural;
+     mode C is verified structurally only — we do not exercise a real
+     subscription round-trip in CI).
 """
 from __future__ import annotations
 
@@ -143,11 +145,12 @@ _MODE_C_PROBE = r"""
 set -euo pipefail
 mkdir -p /home/agent && export HOME=/home/agent
 # Inline the exact mode-C block from start.sh.
-if [ -n "${CODEX_CHATGPT_AUTH_JSON:-}" ]; then
+CODEX_AUTH_BLOB="${CODEX_AUTH_JSON:-${CODEX_CHATGPT_AUTH_JSON:-}}"
+if [ -n "${CODEX_AUTH_BLOB}" ]; then
   CODEX_HOME_DIR="/home/agent/.codex"
   mkdir -p "$CODEX_HOME_DIR"
   AUTH_JSON_PATH="${CODEX_HOME_DIR}/auth.json"
-  printf '%s' "${CODEX_CHATGPT_AUTH_JSON}" > "$AUTH_JSON_PATH"
+  printf '%s' "${CODEX_AUTH_BLOB}" > "$AUTH_JSON_PATH"
   chmod 0600 "$AUTH_JSON_PATH"
   CONFIG_TOML="${CODEX_HOME_DIR}/config.toml"
   touch "$CONFIG_TOML"
@@ -163,19 +166,34 @@ fi
 
 def _start_sh_has_mode_c() -> bool:
     txt = (_ROOT / "start.sh").read_text()
-    return "CODEX_CHATGPT_AUTH_JSON" in txt and "cli_auth_credentials_store" in txt
+    return "CODEX_AUTH_JSON" in txt and "cli_auth_credentials_store" in txt
 
 
 def test_start_sh_contains_mode_c_block() -> None:
     """Guard: the real start.sh carries the mode-C wiring + the
     single-runner intent + the preflight third-credential branch."""
     txt = (_ROOT / "start.sh").read_text()
+    # Canonical Infisical key (/shared/codex-oauth key CODEX_AUTH_JSON)
+    assert "CODEX_AUTH_JSON" in txt
+    # backward-compat alias still recognized (PR #5 name)
     assert "CODEX_CHATGPT_AUTH_JSON" in txt
+    # canonical key must take precedence over the alias
+    assert '${CODEX_AUTH_JSON:-${CODEX_CHATGPT_AUTH_JSON:-}}' in txt
     assert 'cli_auth_credentials_store = "file"' in txt
     assert 'forced_login_method = "chatgpt"' in txt
     assert "single-runner" in txt.lower()
     # preflight must also accept auth.json as the third credential
     assert ".codex/auth.json" in txt
+
+
+def test_codex_cli_pinned_to_0130_exact() -> None:
+    """The Dockerfile must pin @openai/codex to the exact 0.130.0
+    patch — the stable line that supports subscription-OAuth
+    auth.json. A range pin or the legacy 0.57 line is a regression."""
+    df = (_ROOT / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.130.0" in df
+    assert "@openai/codex@~0.57" not in df
+    assert "@openai/codex@^0.72" not in df
 
 
 def _run_probe(env: dict) -> Path:
@@ -191,8 +209,9 @@ def _run_probe(env: dict) -> Path:
 
 
 def test_mode_c_writes_auth_json_and_config_keys(tmp_path) -> None:
+    """Canonical path: CODEX_AUTH_JSON (the Infisical key)."""
     codex_dir = _run_probe({
-        "CODEX_CHATGPT_AUTH_JSON": '{"auth_mode":"chatgpt","tokens":{}}',
+        "CODEX_AUTH_JSON": '{"auth_mode":"chatgpt","tokens":{}}',
         "__TMP_HOME": str(tmp_path),
     })
     auth = codex_dir / "auth.json"
@@ -203,6 +222,28 @@ def test_mode_c_writes_auth_json_and_config_keys(tmp_path) -> None:
     body = toml.read_text()
     assert 'cli_auth_credentials_store = "file"' in body
     assert 'forced_login_method = "chatgpt"' in body
+
+
+def test_mode_c_alias_still_works(tmp_path) -> None:
+    """Backward-compat: the PR #5 CODEX_CHATGPT_AUTH_JSON name still
+    materializes auth.json when the canonical var is unset."""
+    codex_dir = _run_probe({
+        "CODEX_CHATGPT_AUTH_JSON": '{"auth_mode":"chatgpt","alias":1}',
+        "__TMP_HOME": str(tmp_path),
+    })
+    assert (codex_dir / "auth.json").read_text() == \
+        '{"auth_mode":"chatgpt","alias":1}'
+
+
+def test_mode_c_canonical_wins_over_alias(tmp_path) -> None:
+    """If both are set, CODEX_AUTH_JSON must shadow the alias so a
+    Config-tab override can supersede a stale value."""
+    codex_dir = _run_probe({
+        "CODEX_AUTH_JSON": '{"src":"canonical"}',
+        "CODEX_CHATGPT_AUTH_JSON": '{"src":"alias"}',
+        "__TMP_HOME": str(tmp_path),
+    })
+    assert (codex_dir / "auth.json").read_text() == '{"src":"canonical"}'
 
 
 def test_mode_c_is_inert_when_env_unset(tmp_path) -> None:

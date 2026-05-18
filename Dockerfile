@@ -115,12 +115,26 @@ RUN chmod +x /usr/local/bin/start.sh \
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
-# both root and the agent user). Pinned to the 0.57 line — the exact
-# release range proven working in the live-verified prod image
-# (codex-cli 0.57.0; MiniMax `chat` WireApi + app-server protocol).
-# codex's app-server protocol is `experimental` and breaks across
-# minor versions — bump deliberately when validating a new release.
-RUN npm install -g @openai/codex@~0.57
+# both root and the agent user).
+#
+# Pinned EXACTLY to 0.130.0 (not a `~`/`^` range). Rationale:
+#   * 0.130.0 is the npm `latest` dist-tag — the current stable line
+#     (0.131.x is alpha-only at the time of this change; we do not
+#     ship a pre-release CLI in a prod runtime image).
+#   * The previous `~0.57` pin PREDATES `codex login --device-auth` /
+#     ChatGPT-subscription OAuth: it cannot consume the modern
+#     `auth.json` shape ({auth_mode:"chatgpt", tokens:{id_token,
+#     access_token,refresh_token,account_id}, last_refresh}) and
+#     ignores `forced_login_method = "chatgpt"`. The subscription
+#     OAuth credential we now materialize (see start.sh Mode C) is
+#     only usable on a CLI that supports this format — 0.130.0 does.
+#   * config.yaml's default model (`gpt-5.5`) and the May-2026 roster
+#     were already live-verified against codex-cli 0.130.0
+#     linux/amd64 (thread/start returned "model":"gpt-5.5").
+#   * codex's app-server protocol is `experimental` and breaks across
+#     minor versions, so we pin the EXACT patch release rather than a
+#     range — a bump is a deliberate, reviewed, re-verified change.
+RUN npm install -g @openai/codex@0.130.0
 
 USER agent
 WORKDIR /home/agent

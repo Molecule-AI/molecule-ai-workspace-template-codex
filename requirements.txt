@@ -8,8 +8,10 @@ molecule-ai-workspace-runtime>=0.1.0
 #
 # MiniMax provider is wired via a static config.toml written by
 # codex_minimax_config.sh — no proxy or translation layer needed
-# (codex 0.57's WireApi enum natively supports both `responses` and
-# `chat`; MiniMax uses `chat`). The Dockerfile pins @openai/codex
-# to ~0.57 — the exact release line live-verified in prod (the
-# app-server protocol is `experimental` and breaks across minors;
-# bump deliberately when validating a new release).
+# (the codex WireApi enum natively supports both `responses` and
+# `chat`; MiniMax uses `chat`). The Dockerfile pins @openai/codex to
+# the exact patch release 0.130.0 — the npm `latest` stable line and
+# the first pinned line that supports ChatGPT/Codex-subscription
+# OAuth auth.json (the prior ~0.57 pin predated it). The app-server
+# protocol is `experimental` and breaks across minors; bump
+# deliberately, with a re-verification, when validating a new release.
