@@ -200,6 +200,53 @@ if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MINIMAX_API_KEY:-}" ] \
   echo "[start.sh] WARN: no OPENAI_API_KEY, MINIMAX_API_KEY, nor ~/.codex/auth.json. Workspace will fail preflight." >&2
 fi
 
+# --- OAuth refresh watchdog (RFC internal#569) ---
+# Codex CLI 0.130.0 only refreshes auth.json on the demand path
+# `AuthManager::auth().await`. In our prod-Reviewer / prod-Researcher
+# topology the workspace can be idle (or wedged in executor.py) for
+# >8 days between turns, so `auth()` never fires and the access_token
+# silently expires. The watchdog below polls every 6h (default) and
+# refreshes proactively via the same OAuth endpoint the CLI uses
+# (https://auth.openai.com/oauth/token, client_id baked from
+# codex-rs/login/src/auth/manager.rs). Inert when no auth.json is
+# present OR when auth_mode != chatgpt (the API-key / MiniMax paths
+# don't have refresh tokens). The watchdog is started ONLY when an
+# auth.json was actually materialized above — for plain OPENAI_API_KEY
+# or MINIMAX_API_KEY workspaces it doesn't run.
+#
+# Started under gosu agent so it inherits the same uid as molecule-
+# runtime and can read/write the same agent-owned auth.json. PID is
+# the start.sh shell's child; when the container is stopped or
+# restarted the watchdog exits with it (no orphan).
+if [ -s "/home/agent/.codex/auth.json" ]; then
+  WATCHDOG=""
+  for cand in /usr/local/bin/codex_auth_refresh.sh /app/codex_auth_refresh.sh; do
+    if [ -x "$cand" ]; then WATCHDOG="$cand"; break; fi
+  done
+  if [ -n "$WATCHDOG" ]; then
+    # Boot-time priming probe — runs the staleness check once
+    # synchronously so the container starts with a known-good token
+    # window. `--once` returns 0 (refreshed), 1 (skipped because
+    # already fresh), or 2/3 (failure). We log but never fail
+    # start.sh on a refresh problem — the CLI's own demand-path
+    # refresh is still the durable safety net.
+    gosu agent env \
+      CODEX_HOME=/home/agent/.codex \
+      HOME=/home/agent \
+      "$WATCHDOG" --once || \
+      echo "[start.sh] WARN: codex_auth_refresh --once non-zero; continuing — watchdog loop will retry" >&2
+    # Long-running loop (background, gosu agent). Output goes to
+    # docker logs alongside molecule-runtime.
+    gosu agent env \
+      CODEX_HOME=/home/agent/.codex \
+      HOME=/home/agent \
+      "$WATCHDOG" &
+    echo "[start.sh] codex_auth_refresh watchdog launched (pid=$!)"
+  else
+    echo "[start.sh] WARN: codex_auth_refresh.sh not found; OAuth proactive refresh disabled (RFC internal#569)" >&2
+  fi
+fi
+
 # Hand off to molecule-runtime. From here, every A2A message routes
 # through executor.py → app_server.py → codex app-server child.
 exec gosu agent molecule-runtime

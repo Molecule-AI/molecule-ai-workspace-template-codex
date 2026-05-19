@@ -137,10 +137,17 @@ COPY render_provider_toml.py /usr/local/bin/render_provider_toml.py
 # It also lives in /app via the COPY above for adapter.py import.
 COPY provider_config.py /usr/local/bin/provider_config.py
 COPY codex_minimax_config.sh codex_mcp_config.sh /usr/local/bin/
+# codex_auth_refresh.sh — OAuth refresh watchdog (RFC internal#569).
+# start.sh launches it as `gosu agent` after auth.json is materialized;
+# it polls every 6h and rewrites auth.json atomically when the access
+# token is within 4h of expiry OR last_refresh is older than 7d. Inert
+# when no auth.json is present (the API-key / MiniMax paths skip it).
+COPY codex_auth_refresh.sh /usr/local/bin/codex_auth_refresh.sh
 RUN chmod +x /usr/local/bin/start.sh \
              /usr/local/bin/codex_minimax_config.sh \
              /usr/local/bin/codex_mcp_config.sh \
-             /usr/local/bin/render_provider_toml.py
+             /usr/local/bin/render_provider_toml.py \
+             /usr/local/bin/codex_auth_refresh.sh
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
