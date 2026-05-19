@@ -28,8 +28,10 @@ dispatch, notification accumulation, error surface.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +45,50 @@ from molecule_runtime.executor_helpers import extract_message_text
 from app_server import AppServerError, AppServerProcess
 
 logger = logging.getLogger(__name__)
+
+# Codex CLI version baked into the image. Read from npm-published
+# package metadata at install time when available; falls back to the
+# Dockerfile pin string. Used as a label on the wedge-incident log line
+# so Loki can slice "wedge rate per codex-cli version" without scraping
+# image SHAs. Kept in sync manually with the Dockerfile pin — there's a
+# regression test that asserts they match.
+CODEX_CLI_VERSION = os.environ.get("CODEX_CLI_VERSION", "0.130.0")
+
+# Structured-log event key for the SSE-wedge incident. Loki ruler matches
+# on this exact string (see operator-config:obs/loki/rules/fake/
+# codex-wedge.yml). Do NOT rename without updating the rule.
+_WEDGE_EVENT_TYPE = "incident.codex_wedge"
+
+
+def _derive_auth_mode_label() -> str:
+    """Best-effort auth-mode label for obs.
+
+    Matches ``provider_config._BUILTIN_PROVIDERS`` selection order:
+    subscription credentials win over the pay-as-you-go API key. Returns
+    a stable string ("chatgpt_subscription" / "openai_api" /
+    "custom_anthropic_compat" / "unknown") so the Loki rule can group
+    by it without per-provider knowledge.
+
+    This is a LABEL only — it is not authoritative for routing. The
+    authoritative selection happens in ``render_provider_toml.py`` at
+    boot and is reflected in ``~/.codex/config.toml``. We re-derive here
+    rather than parse that TOML so a wedge in a process that never
+    finished boot still emits *something*.
+    """
+    if os.environ.get("CODEX_AUTH_JSON") or os.environ.get(
+        "CODEX_CHATGPT_AUTH_JSON"
+    ):
+        return "chatgpt_subscription"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai_api"
+    # Kimi / MiniMax / other Anthropic-compat providers go through the
+    # custom_anthropic_compat path (provider_config.AUTH_MODE_CUSTOM_*).
+    # We don't try to discriminate further here.
+    if os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get(
+        "ANTHROPIC_API_KEY"
+    ):
+        return "custom_anthropic_compat"
+    return "unknown"
 
 
 # Per-turn timeout. Codex turns can run minutes during heavy tool use
@@ -475,12 +521,23 @@ class CodexAppServerExecutor(AgentExecutor):
                 last_activity_at = now
 
             if now - last_activity_at >= _TURN_INACTIVITY_TIMEOUT:
+                wedge_duration = now - last_activity_at
                 logger.warning(
                     "codex turn %s wedged: no events for %.0fs "
                     "(deltas=%d) — failing turn",
                     state.turn_id,
-                    now - last_activity_at,
+                    wedge_duration,
                     len(state.deltas),
+                )
+                # Structured JSONL line for obs. Picked up by the tenant
+                # Vector pipeline (already shipping container stdout to
+                # Loki — see mc#1572 audit-log finding) and matched by
+                # the codex-wedge Loki ruler. One line per wedge; do NOT
+                # emit on every tick or the rule's "≥2 wedges/h" cutoff
+                # becomes meaningless.
+                self._emit_wedge_incident(
+                    state=state,
+                    wedge_duration_seconds=wedge_duration,
                 )
                 raise asyncio.TimeoutError(
                     f"codex emitted no events for "
@@ -491,6 +548,51 @@ class CodexAppServerExecutor(AgentExecutor):
                     f"codex turn exceeded total budget "
                     f"{_TURN_TIMEOUT:.0f}s"
                 )
+
+    def _emit_wedge_incident(
+        self, *, state: _TurnState, wedge_duration_seconds: float,
+    ) -> None:
+        """Emit one JSONL incident line on the SSE wedge.
+
+        Schema (Loki query-friendly):
+          event_type            — always "incident.codex_wedge"
+          workspace_id          — from WORKSPACE_ID env (runtime-set);
+                                  empty if missing rather than raising
+          turn_id               — the codex turn UUID
+          deltas_at_wedge       — agent_message_delta count seen so far
+          wedge_duration_seconds — gap between last event and now
+          codex_cli_version     — Dockerfile pin (currently 0.130.0)
+          model                 — configured model (e.g. "gpt-5.5")
+          auth_mode             — chatgpt_subscription / openai_api /
+                                  custom_anthropic_compat (from
+                                  provider_config.py)
+          ts                    — RFC-3339 emit time, UTC
+
+        Per-tenant Vector ships container stdout to Loki under
+        {tenant=<tenant>, service="molecule-tenant"}; the wedge line is
+        therefore queryable directly without a separate sink.
+
+        Failures here MUST NOT propagate — observability emission can
+        never block the wedge-fail path itself.
+        """
+        try:
+            payload = {
+                "event_type": _WEDGE_EVENT_TYPE,
+                "workspace_id": os.environ.get("WORKSPACE_ID", ""),
+                "turn_id": state.turn_id or "",
+                "deltas_at_wedge": len(state.deltas),
+                "wedge_duration_seconds": round(wedge_duration_seconds, 1),
+                "codex_cli_version": CODEX_CLI_VERSION,
+                "model": self._config.model or "",
+                "auth_mode": _derive_auth_mode_label(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            # logger.info so it surfaces at default level; the structured
+            # JSON is the FIRST and ONLY field in the message so json-
+            # parsing in Loki ruler is unambiguous.
+            logger.info(json.dumps(payload, separators=(",", ":")))
+        except Exception:  # pragma: no cover — emission must never break wedge handling
+            logger.exception("failed to emit codex_wedge incident line")
 
     async def _reset_app_server(self) -> None:
         """Tear down + clear cached child. Idempotent."""

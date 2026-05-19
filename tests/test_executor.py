@@ -330,6 +330,69 @@ async def test_inactivity_watchdog_surfaces_error_on_silent_channel(
 
 
 @pytest.mark.asyncio
+async def test_wedge_emits_incident_jsonl(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The wedge path MUST log a single JSONL incident line that the
+    Loki ruler can match.
+
+    Schema is load-bearing (operator-config rule keys on
+    ``event_type``, ``workspace_id``, ``codex_cli_version``). If any of
+    those drift here, the alert silently stops firing.
+    """
+    import json
+    import logging
+
+    import executor as exec_mod
+
+    monkeypatch.setattr(exec_mod, "_TURN_INACTIVITY_TIMEOUT", 0.3)
+    monkeypatch.setattr(exec_mod, "CODEX_CLI_VERSION", "0.130.0")
+    monkeypatch.setenv("WORKSPACE_ID", "ws-test-42")
+    monkeypatch.setenv("CODEX_AUTH_JSON", "{}")  # picks subscription label
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    fake = FakeAppServer()
+    ex = _make_executor(fake, model="gpt-5.5")
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push_delta("h")  # one delta so deltas_at_wedge=1
+        # then silence — wedge.
+
+    caplog.set_level(logging.INFO, logger="executor")
+    driver_task = asyncio.create_task(driver())
+    with pytest.raises(asyncio.TimeoutError, match="channel wedged"):
+        await ex._run_turn("hi")
+    await driver_task
+
+    # Find the JSONL payload in the captured log records. Filter by the
+    # event-type literal so this test doesn't match the warning line.
+    jsonl_records = [
+        r for r in caplog.records
+        if r.name == "executor"
+        and r.levelno == logging.INFO
+        and '"incident.codex_wedge"' in r.getMessage()
+    ]
+    assert len(jsonl_records) == 1, (
+        f"expected exactly one wedge-incident JSONL record, got "
+        f"{len(jsonl_records)}: {[r.getMessage() for r in jsonl_records]}"
+    )
+    payload = json.loads(jsonl_records[0].getMessage())
+    assert payload["event_type"] == "incident.codex_wedge"
+    assert payload["workspace_id"] == "ws-test-42"
+    assert payload["turn_id"]  # non-empty
+    assert payload["deltas_at_wedge"] == 1
+    assert payload["wedge_duration_seconds"] >= 0.3
+    assert payload["codex_cli_version"] == "0.130.0"
+    assert payload["model"] == "gpt-5.5"
+    assert payload["auth_mode"] == "chatgpt_subscription"
+    assert payload["ts"].endswith("Z")
+
+
+@pytest.mark.asyncio
 async def test_inactivity_watchdog_resets_on_each_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
